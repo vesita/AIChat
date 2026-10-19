@@ -6,10 +6,16 @@
 #   控制台    127.0.0.1:3210        ← 只回环，经 SSH 隧道访问
 #
 # 代码与数据分离是热更新的前提：换代码只动 /opt/aichat/app，数据一个字节都不碰。
+#
+# ★ 启动顺序：NapCat 是 **vesita 的用户级 unit**，本服务是系统单元，
+#   跨 manager 写不了依赖（After= 只在本 manager 内生效）。所以不声明依赖，
+#   改成靠 Restart=always + ExecStartPre 等 OneBot 就绪来收敛：
+#   NapCat 没起来时这里退不出启动，Restart 每 5 秒重试，直到 OneBot 应答。
 [Unit]
 Description=AIChat QQ 群 AI 机器人（headless）
-After=network-online.target podman-napcat.service
+After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -18,12 +24,13 @@ WorkingDirectory=/opt/aichat/app
 Environment=QQ_AGENT_DATA_DIR=/var/lib/aichat/data
 Environment=QQ_AGENT_PORT=3210
 Environment=NODE_ENV=production
+# 等 OneBot HTTP 就绪再起：最多等 180 秒，超时就让本次启动失败、交给 Restart 重试。
+# 这样 NapCat 慢一拍时不会出现「起了但连不上、之后再也不重连」的僵局。
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 180); do curl -sf -m 2 -o /dev/null http://127.0.0.1:3002/get_login_info && exit 0; sleep 1; done; echo "OneBot 180 秒内未就绪" >&2; exit 1'
 ExecStart=/usr/bin/node src/server.js
 Restart=always
 RestartSec=5
-# 别让 systemd 反复重启把日志刷爆：一分钟 5 次就停。
-StartLimitBurst=5
-StartLimitIntervalSec=60
+# QQ 消息不会丢：未读消息留在 data/messages/*.json，起来后自己补处理。
 
 [Install]
 WantedBy=multi-user.target
