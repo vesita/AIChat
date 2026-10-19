@@ -1,0 +1,29 @@
+# AIChat（QQ 群 AI 机器人）的 systemd 单元。
+#
+# 部署形态（noco）：
+#   代码检出  /opt/aichat/app       ← chat 分支，由 aichat-update 快进
+#   可写数据  /var/lib/aichat/data  ← QQ_AGENT_DATA_DIR（config/sessions/messages/memory 全在这）
+#   控制台    127.0.0.1:3210        ← 只回环，经 SSH 隧道访问
+#
+# 代码与数据分离是热更新的前提：换代码只动 /opt/aichat/app，数据一个字节都不碰。
+[Unit]
+Description=AIChat QQ 群 AI 机器人（headless）
+After=network-online.target podman-napcat.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vesita
+WorkingDirectory=/opt/aichat/app
+Environment=QQ_AGENT_DATA_DIR=/var/lib/aichat/data
+Environment=QQ_AGENT_PORT=3210
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+RestartSec=5
+# 别让 systemd 反复重启把日志刷爆：一分钟 5 次就停。
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Install]
+WantedBy=multi-user.target

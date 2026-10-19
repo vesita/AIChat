@@ -1,0 +1,7 @@
+[Unit]
+Description=AIChat 更新（拉 chat 分支 → 重启 → 健康检查 → 失败回滚）
+After=network-online.target aichat.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/aichat/app/deploy/update.sh
