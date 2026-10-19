@@ -1,47 +1,51 @@
-# NapCat 容器排障（实测 + 上游文档）
+# NapCat 容器排障（全部为 noco 现场实测）
 
-这些结论来自在 Debian 13 上部署 `mlikiowa/napcat-docker` 时踩到的真实问题。
+## 一、重启免扫码：三条缺一不可
 
-## 症状与根因对照
-
-| 症状 | 根因 | 判据 |
-|---|---|---|
-| 宿主机 `ss` 看到 3001/3002 在监听，但 `curl` 返回 000 | **没登录**。OneBot 适配器要等 QQ 登录成功才启动监听；没登录时那些端口只是 podman 的空转发 | 容器内 `cat /proc/net/tcp` 里没有 `0BB9`(3001)/`0BBA`(3002)；容器内 `curl` 返回 000 |
-| 改了 `onebot11.json` 但 HTTP 不生效 | 登录过之后，NapCat 读**账号级**配置 `onebot11_<QQ号>.json`，忽略全局模板 | `ls config/` 里存在 `onebot11_<QQ号>.json` |
-| 运行中改配置，重启后改动消失 | NapCat 把配置载入内存，退出时用内存里的旧值覆盖文件 | 文件 mtime 在改动后又被回写 |
-| 容器退出码 137、重启就掉登录 | `podman restart` 对不响应 SIGTERM 的 QQ 升级为 SIGKILL | `OOMKilled=false` 且日志有 SIGKILL 痕迹 |
-
-## 改配置的正确顺序
-
-**必须先停进程，再改文件，再启动** —— 运行中改会被内存覆盖。
+实测做法（`deploy/napcat.sh` 已固化）：
 
 ```bash
-deploy/napcat.sh stop        # stop -t 60，别用 podman restart
-# 改 config/onebot11_<QQ号>.json（httpServers 的 host 必须是 0.0.0.0）
-deploy/napcat.sh start
+podman run -d --name napcat --restart=unless-stopped \
+  --network=bridge --mac-address=<固定MAC> \
+  -e NAPCAT_QUICK_ACCOUNT=<QQ号> -e NAPCAT_QUICK_PASSWORD=<密码> \
+  -v ~/napcat/qq:/app/.config/QQ -v ~/napcat/config:/app/napcat/config ...
 ```
 
-## 配置要点
+| 条件 | 缺了会怎样 |
+|---|---|
+| 持久化 `/app/.config/QQ` | 登录凭证与设备指纹丢失（约 90 MB），必然重扫 |
+| 固定 MAC（`--mac-address`） | 容器重建换 MAC，QQ 判成新设备，凭证当场作废 |
+| `NAPCAT_QUICK_ACCOUNT` + `NAPCAT_QUICK_PASSWORD` | 只出二维码，不自动登录 |
 
-- `host` 必须是 `"0.0.0.0"`。写 `127.0.0.1` 时容器内的 loopback 与 podman 的端口转发对不上，外部必然连不上。
-- `port` 必须是数字，不是字符串。
-- `httpServers` 必须在 `network` 下面。
-- 容器要 `-p` 映射对应端口，否则宿主机连不上。
+实测结果：连续两次 `stop -t 60` + `start`，日志均出现
+`[NapCat] [WebUi] 自动快速登录成功: <QQ号>`，随后 OneBot 适配器就绪、HTTP 200。
 
-## 状态判断（别只看 `podman ps`）
+**注意**：`--mac-address` 必须配 `--network=bridge`，否则报
+`invalid config provided: networks and static ip/mac address can only be used with Bridge mode networking`。
 
-容器 `Up` 不等于服务就绪 —— QQ 进程可能还在等扫码。
+## 二、HTTP/WS 端口「在听但连不上」
 
-```bash
-podman logs napcat 2>&1 | grep -aE "二维码解码URL|适配器初始化完成|HTTP Server"
-```
+**根因几乎总是没登录。** OneBot 适配器要等 QQ 登录成功才启动监听；
+没登录时宿主机 `ss` 看到的 3001/3002 只是 podman 的空转发。
 
-出现 `[AdapterManager] OneBot11 适配器初始化完成` 才算登录成功、适配器起来了。
+判据：
+- 容器内 `cat /proc/net/tcp` 里没有 `0BB9`(3001) / `0BBA`(3002)
+- 容器内 `curl` 返回 000
+- 日志没有 `[OneBot] [HTTP Server Adapter] Start On ...`
 
-## 登录态为什么保不住
+## 三、配置改了不生效
 
-QQ 的登录凭证落在 `~/napcat/qq/nt_qq_<hash>/`（约 123 MB），**扫码一次后数据在**，
-但容器重启后 QQ 客户端不会自动用它 —— 需要 QuickLogin 或重新扫码。
+登录过之后 NapCat 读**账号级**配置 `config/onebot11_<QQ号>.json`，
+全局 `onebot11.json` 被忽略。改错文件是最常见的白费功夫。
 
-`-e ACCOUNT=<QQ号>` 这条路实测会让 worker 崩溃（退出码 11，3 次后主进程退出），
-不要用。正确变量是 `NAPCAT_QUICK_ACCOUNT` + `NAPCAT_QUICK_PASSWORD`（未在本部署验证）。
+另外运行中改配置会被内存里的旧值覆盖 —— 必须**停进程 → 改文件 → 启动**。
+
+## 四、`podman restart` 会毁掉登录态
+
+QQ 不响应 SIGTERM，podman 等 10 秒升级为 SIGKILL（退出码 137，`OOMKilled=false`），
+登录态跟着丢。用 `podman stop -t 60` 再 `start`。
+
+## 五、不要用的配置
+
+`-e ACCOUNT=<QQ号>`：实测让 worker 崩溃（退出码 11，10 秒内 3 次后主进程退出）。
+正确环境变量是 `NAPCAT_QUICK_ACCOUNT`。
