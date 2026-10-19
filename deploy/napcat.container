@@ -1,0 +1,49 @@
+# NapCat 的 quadlet 定义（podman 5.x 原生 systemd 集成）。
+#
+# 放在 ~/.config/containers/systemd/napcat.container，`systemctl --user daemon-reload`
+# 之后由 quadlet 生成 napcat.service —— 容器因此成了真正的 systemd 单元，
+# 别的服务才能用 After=/Requires= 声明依赖（写一个不存在的 podman-*.service 是无效的）。
+#
+# 本文件进公开仓，所以**现场取值一律不写死**：
+#   MAC 与 QQ 号由 deploy/install-napcat-unit.sh 在安装时渲染进
+#   ~/.config/containers/systemd/napcat.container（或直接改本文件的副本），
+#   密码走 EnvironmentFile（0600，不在仓内）。
+#
+# 三条免扫码条件（缺一条就退化成每次重启扫码，见 TROUBLESHOOTING.md）：
+#   1. 持久化 /app/.config/QQ
+#   2. 固定 MAC —— 换 MAC 等于新设备，凭证当场作废
+#   3. NAPCAT_QUICK_ACCOUNT + NAPCAT_QUICK_PASSWORD
+[Unit]
+Description=NapCat QQ 协议端（OneBot v11）
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Container]
+ContainerName=napcat
+Image=docker.io/mlikiowa/napcat-docker:latest
+Network=bridge
+# __FIXED_MAC__ 由 install-napcat-unit.sh 替换成现场值。
+# 必须配 Network=bridge，否则 podman 报
+# "networks and static ip/mac address can only be used with Bridge mode networking"
+PodmanArgs=--mac-address=__FIXED_MAC__
+Environment=MODE=ws
+Environment=TZ=Asia/Shanghai
+# __BOT_QQ__ 由 install-napcat-unit.sh 替换成现场值
+Environment=NAPCAT_QUICK_ACCOUNT=__BOT_QQ__
+EnvironmentFile=%h/napcat/napcat.env
+PublishPort=127.0.0.1:6099:6099
+PublishPort=127.0.0.1:3001:3001
+PublishPort=127.0.0.1:3002:3002
+Volume=%h/napcat/qq:/app/.config/QQ:Z
+Volume=%h/napcat/config:/app/napcat/config:Z
+
+[Service]
+Restart=always
+RestartSec=10
+# QQ 不响应 SIGTERM，给足时间让登录态落盘。默认 10 秒会 SIGKILL（退出码 137）。
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

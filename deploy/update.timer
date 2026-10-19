@@ -1,0 +1,10 @@
+[Unit]
+Description=每天检查一次 AIChat 更新（chat 分支）
+
+[Timer]
+OnCalendar=*-*-* 06:30:00
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target
