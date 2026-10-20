@@ -165,12 +165,33 @@ export const DEFAULT_CONFIG = {
   snowluma: {
     dir: '',                   // SnowLuma 程序目录；留空 = 自动探测项目内 ./snowluma
     autoLaunch: false,         // 应用启动时自动拉起 SnowLuma（未运行时）
+    // 协议端形态：'auto'（按 dir/autoLaunch/端口自动判，见 resolveProtocolMode）
+    //             | 'embedded'（本应用管理内置 SnowLuma，可钉死）
+    //             | 'external'（协议端由外部提供，如 NapCat 容器；可钉死）
+    mode: 'auto',
     // 第二实例默认连自己的 OneBot 端口（3001/3000 + 偏移），
     // 否则两个实例会同时连到主实例的 SnowLuma，消息被处理两遍。
     wsUrl: `ws://127.0.0.1:${3001 + portOffset()}`,
     httpUrl: `http://127.0.0.1:${3000 + portOffset()}`,
     accessToken: '',           // WebSocket 令牌
     httpAccessToken: ''        // HTTP API 令牌（SnowLuma 可与 WS 不同；留空沿用 accessToken）
+  },
+  // QQ 扫码登录（控制台「QQ 登录」面板）。实现：src/qq-login.js。
+  // 现场与接口契约见 doc/audit/console-access-plan.md §8/§9/§12.1。
+  qqLogin: {
+    // NapCat WebUI（容器端口映射见 deploy/napcat.container；只发布在回环）
+    webuiUrl: 'http://127.0.0.1:6099',
+    // WebUI 令牌只从文件读（napcat 的 webui.json），配置里存令牌值会被 /api/config 漏出：
+    // 脱敏规则只认键名裸 token，webuiToken 不在其中。
+    webuiTokenFile: '~/napcat/config/webui.json',
+    requestTimeoutMs: 1500,     // 单次 WebUI 调用超时（回环，够用）
+    pollIdleMs: 90000,          // 无人在看时停止轮询的静默期
+    actionCooldownMs: 3000,     // start/refresh 冷却（防连点打崩登录服务）
+    qrTtlMs: 120000,            // 前端倒计时估计值；真实 TTL 以 NapCat 为准
+    qrSvgWidth: 240,
+    statusProbeMs: 1000,        // 面板轮询时对 WebUI 的最小探测间隔
+    credentialTtlMs: 3000000,   // WebUI 凭据缓存（NapCat 侧 1 小时有效）
+    fallbackContainerQrcode: false // 应急分支：WebUI 不可用时读容器内 qrcode.png
   },
   // 人设与行为
   persona: {
@@ -401,6 +422,7 @@ export const DEFAULT_CONFIG = {
 };
 
 /** 深合并（含 __replace__ 整体替换约定）。导出供 routes.js 的预览端点做"不落盘的临时合并"。 */
+
 // ── 参与策略 / AI 判定：统一口径的读写辅助 ────────────────────────────────
 // 单一定义点：解析层（prompt.resolveContextTier）、系统提示（buildSystemPrompt）、
 // 核心短路（orchestrator）都从这里取，避免三处各写一遍"什么算 AI 模式"。
@@ -452,6 +474,87 @@ export function deepMerge(base, override) {
     }
   }
   return out;
+}
+
+// ── 协议端形态：外部协议端模式的**单一判定点** ──────────────────────────
+//
+// 现场错配（doc/audit/protocol-side-mismatch.md S1/S2/U 组）的根因是同一件事
+// 「协议端到底是谁管的」在 UI、状态、诊断、启停接口里各判一遍，且多数路径默认
+// 「本应用管理内置 SnowLuma」。这里给出唯一判定点：所有消费方（/api/status、
+// 诊断文案、/api/snowluma/* 的 409 闸）都只调用它，不许本地再写一套。
+//
+// 判定只读**配置**，不读运行期健康（端口开没开、WS 连没连）：
+// 形态是"部署方式"，健康是"此刻状态"。把健康混进形态会让 mode 随断线翻转，
+// 诊断文案跟着在两个故事之间跳。健康面见 onebot.dataPathStatus()/httpOk。
+//
+// 自动判定（explicitMode='auto'）：
+//   外部模式 ⇔ dir 为空 ∧ autoLaunch=false ∧ wsUrl/httpUrl 可解析
+//              ∧ httpUrl 端口 ≠ 3000（出厂默认恰好是 Forgejo 的端口）
+//   其余情况：有内置目录 ⇒ embedded；配置自相矛盾/不可解析/仍是出厂默认 ⇒
+//   unconfigured（"协议端未配置"），既不算内置也不算外部，诊断给"去配置端口"。
+// 3000 那条是刻意的：全新部署/配置段丢失时 httpUrl 会漂回 3000，它指向的是
+// Forgejo 而不是 OneBot；这种情况绝不能判成"外部协议端已配好"。
+export const PROTOCOL_MODE = Object.freeze({
+  EMBEDDED: 'embedded',
+  EXTERNAL: 'external',
+  UNCONFIGURED: 'unconfigured'
+});
+
+/** 从 ws:// · http:// · wss:// · https:// 取端口；不可解析返回 0。 */
+function endpointPort(raw) {
+  try {
+    const u = new URL(String(raw || ''));
+    if (u.port) return Number(u.port);
+    return Number(u.protocol === 'https:' || u.protocol === 'wss:' ? 443 : 80);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 判定协议端形态。纯函数、无 I/O —— 测试可直接喂参数覆盖所有分支。
+ * @returns {{mode:'embedded'|'external'|'unconfigured', reason:string, wsPort:number, httpPort:number}}
+ */
+export function resolveProtocolMode({
+  dir = '', autoLaunch = false, wsUrl = '', httpUrl = '', explicitMode = 'auto'
+} = {}) {
+  const wsPort = endpointPort(wsUrl);
+  const httpPort = endpointPort(httpUrl);
+  const ports = { wsPort, httpPort };
+  const explicit = String(explicitMode || 'auto').trim().toLowerCase();
+  if (explicit === PROTOCOL_MODE.EMBEDDED || explicit === PROTOCOL_MODE.EXTERNAL) {
+    return { mode: explicit, reason: `配置显式指定 snowluma.mode=${explicit}`, ...ports };
+  }
+  const dirText = String(dir || '').trim();
+  if (dirText) {
+    return { mode: PROTOCOL_MODE.EMBEDDED, reason: `检测到内置 SnowLuma 目录：${dirText}`, ...ports };
+  }
+  if (autoLaunch === true) {
+    return {
+      mode: PROTOCOL_MODE.UNCONFIGURED,
+      reason: 'snowluma.dir 为空但 autoLaunch=true（配置自相矛盾：没有内置目录可拉起）',
+      ...ports
+    };
+  }
+  if (!wsPort || !httpPort) {
+    return {
+      mode: PROTOCOL_MODE.UNCONFIGURED,
+      reason: `wsUrl/httpUrl 不可解析（ws=${wsUrl || '空'} http=${httpUrl || '空'}），无法判定协议端形态`,
+      ...ports
+    };
+  }
+  if (httpPort === 3000) {
+    return {
+      mode: PROTOCOL_MODE.UNCONFIGURED,
+      reason: 'snowluma.httpUrl 仍是出厂默认端口 3000（该端口现场可能是 Forgejo 等无关服务），请配置为 OneBot HTTP API 端口（如 3002）',
+      ...ports
+    };
+  }
+  return {
+    mode: PROTOCOL_MODE.EXTERNAL,
+    reason: `外部协议端模式：无内置 SnowLuma 目录、未自动拉起，WS 端口 ${wsPort} / HTTP 端口 ${httpPort} 指向外部端点（如 NapCat 容器）`,
+    ...ports
+  };
 }
 
 export function loadConfig() {

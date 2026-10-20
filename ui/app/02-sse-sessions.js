@@ -1,8 +1,13 @@
 // 〔SSE / 会话视图〕——M9 拆分第 3 段
 'use strict';
 // ── SSE ──
+// SSE 连接状态（401 无令牌时用于"连续 3 次失败就停重连 + 顶部提示"）。
+let sseRetry = { es: null, errors: 0 };
 function connectSSE() {
-  const es = new EventSource(consoleUrl('/api/events'));
+  // EventSource 不能设置请求头 ⇒ 令牌只能走 ?token=（withConsoleToken 保留子路径前缀）。
+  const es = new EventSource(withConsoleToken(consoleUrl('/api/events')));
+  sseRetry = { es, errors: 0 };
+  es.onopen = () => { sseRetry.errors = 0; };
   es.addEventListener('session-start', () => {
     scheduleListReload();
     refreshStatus();
@@ -169,7 +174,24 @@ function connectSSE() {
       } catch { /* 拉结果失败就保持现状 */ }
     }
   });
-  es.onerror = () => { /* EventSource 自动重连 */ };
+  es.onerror = () => {
+    // 无令牌时 EventSource 会 401 并自动重连，无限刷请求且顶栏永不更新。
+    // 连续 3 次失败且本页确实没有令牌 ⇒ 明确提示「用带 ?token= 的地址打开」并停止重连（§10.2）。
+    if (sseRetry.es !== es) return;
+    sseRetry.errors++;
+    if (sseRetry.errors >= 3 && !getConsoleToken()) {
+      try { es.close(); } catch { /* ignore */ }
+      showConsoleAuthBanner('未授权：请用带 ?token= 的地址打开控制台');
+    }
+  };
+}
+
+/** 顶栏固定提示（SSE 401 用；不带关闭按钮，修好令牌刷新页面即消失）。 */
+function showConsoleAuthBanner(text) {
+  const banner = $('#banner');
+  if (!banner) return;
+  banner.textContent = text;
+  uiShow(banner, () => banner.classList.remove('hidden'), false);
 }
 
 // ── 会话视图 ──

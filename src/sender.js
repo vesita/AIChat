@@ -14,6 +14,13 @@ const DEFAULT_MAX_PER_HOUR = DEFAULT_CONFIG.send.maxPerHour;
 // 出站硬上限的滚动窗口（1 小时）与默认值（2000 条）。0 = 不限。
 const OUTBOUND_WINDOW_MS = 3600000;
 const DEFAULT_MAX_MESSAGES_PER_HOUR = DEFAULT_CONFIG.store?.limits?.maxMessagesPerHour ?? 2000;
+// D-1：「超时但结果不确定」的发送占位窗口。发送前先登记占位，超时/中止类失败保留它，
+// 期间相同文本的重发被拦下 —— 覆盖「OneBot 发送超时 90 秒」远大于原 8 秒去重窗口的缺口。
+// 明确失败（限频/4xx/出站硬上限）立即释放占位，合法重试不受影响。
+const DEFAULT_UNCONFIRMED_WINDOW_MS = 120000;
+// 负向对照开关（仅测试用）：COREFIX_D1=0 回到"只有成功后记账"的旧行为。
+// 生产不设该环境变量 → 修复恒开。
+const FIX_SEND_IDEMPOTENCY = process.env.COREFIX_D1 !== '0';
 
 /**
  * 本地路径 → OneBot 能识别的 file URI。
@@ -62,6 +69,11 @@ export class SendQueue {
     this.minuteTimes = new Map(); // chatKey -> [ts]
     this.hourTimes = new Map();   // chatKey -> [ts]
     this.recentSent = new Map();  // "chatKey::text" -> ts（发送去重窗口）
+    // D-1：发送**前**登记的 attempt 占位。"chatKey::text" -> { at }。
+    // 与 recentSent 的区别：recentSent 只在协议端成功返回后记；
+    // pendingSends 在发出前就记，超时/中止这类「结果不确定」的失败保留它，
+    // 让 30 秒后模型重发的同一文本被拦下（否则会出现两条一模一样的消息）。
+    this.pendingSends = new Map();
   }
 
   #chain(chatKey) {
@@ -106,21 +118,21 @@ export class SendQueue {
 
   /**
    * 只读判断：窗口期内是否已发出过相同内容。
-   * ⚠️ 绝不在发送前记账 —— 发送失败（OneBot 报错/限频）的消息必须允许重试，
-   * 提前记账会把合法重试误判为重复、导致消息静默丢失。
+   * ⚠️ 这里查的是"确认成功"的去重指纹；"结果不确定"的发送占位在 #isPendingHit 里查。
+   * 时间源用注入时钟（测试要模拟"30 秒后重发"，不能真等 30 秒）。
    */
   #isDuplicate(chatKey, text) {
     const win = this.#dedupeWindow();
     if (!win) return false;
     const last = this.recentSent.get(`${chatKey}::${String(text)}`);
-    return Boolean(last && Date.now() - last < win);
+    return Boolean(last && this.now() - last < win);
   }
 
   /** 发送成功后记账（去重指纹）。 */
   #markSent(chatKey, text) {
     const win = this.#dedupeWindow();
     if (!win) return;
-    const now = Date.now();
+    const now = this.now();
     this.recentSent.set(`${chatKey}::${String(text)}`, now);
     // 顺手清理过期条目，避免 Map 无限增长
     if (this.recentSent.size > 500) {
@@ -128,6 +140,69 @@ export class SendQueue {
         if (now - t > win) this.recentSent.delete(k);
       }
     }
+  }
+
+  /** 「结果不确定」的发送占位窗口（毫秒；0 = 关闭该语义）。 */
+  #unconfirmedWindow() {
+    const raw = getConfig().send?.unconfirmedWindowMs;
+    // 0 是明确的关闭值，不能当默认值。
+    if (raw === null || raw === undefined || raw === '') return DEFAULT_UNCONFIRMED_WINDOW_MS;
+    const n = Number(raw);
+    return Number.isFinite(n) ? Math.max(0, n) : DEFAULT_UNCONFIRMED_WINDOW_MS;
+  }
+
+  /**
+   * 发送**前**登记占位（D-1）。
+   *
+   * 为什么必须提前：发送超时（90 秒）时无法判断协议端到底收没收到。旧实现只在
+   * 成功返回后才记去重指纹，于是"超时但已送达"的第一次完全不留痕 —— 模型重发时
+   * 间隔早已超过 8 秒去重窗口，群里就出现两条一样的消息。
+   */
+  #markPending(chatKey, text) {
+    if (!FIX_SEND_IDEMPOTENCY) return;
+    const win = this.#unconfirmedWindow();
+    if (!win) return;
+    const now = this.now();
+    this.pendingSends.set(`${chatKey}::${String(text)}`, { at: now });
+    if (this.pendingSends.size > 500) {
+      for (const [k, v] of this.pendingSends) {
+        if (now - v.at > win) this.pendingSends.delete(k);
+      }
+    }
+  }
+
+  /** 发送有了确定结论（成功 / 明确失败）→ 释放占位。 */
+  #clearPending(chatKey, text) {
+    this.pendingSends.delete(`${chatKey}::${String(text)}`);
+  }
+
+  /** 只读判断：窗口期内是否有"可能已送达"的同文本发送占位。 */
+  #isPendingHit(chatKey, text) {
+    if (!FIX_SEND_IDEMPOTENCY) return false;
+    const win = this.#unconfirmedWindow();
+    if (!win) return false;
+    const key = `${chatKey}::${String(text)}`;
+    const p = this.pendingSends.get(key);
+    if (!p) return false;
+    if (this.now() - p.at < win) return true;
+    this.pendingSends.delete(key);   // 过期：下次允许正常重发
+    return false;
+  }
+
+  /**
+   * 发送错误的「确定性」分类（D-1 的核心判据）：
+   *   · 超时 / 中止 / 网络中断 → **结果不确定**：协议端可能已经收下并发出去了，
+   *     必须保留占位（再发一次就是重复发言）；
+   *   · 限频 / 出站硬上限 / OneBot 4xx → **明确失败**：消息肯定没进 QQ，
+   *     立刻释放占位，允许正常重试（不能把合法重试误判成重复而静默丢消息）。
+   */
+  #isUncertainSendError(error) {
+    if (!error) return false;
+    if (error.code === 'OUTBOUND_HARD_LIMIT') return false;
+    const msg = String(error?.message ?? error);
+    if (/发送频率超限/.test(msg)) return false;
+    if (/HTTP\s*4\d\d/i.test(msg)) return false;
+    return /超时|timeout|timed out|中止|abort|cancel|EAI_AGAIN|ECONNRESET|socket hang up|fetch failed|网络|连接失败|请求失败/i.test(msg);
   }
 
   #gap(text, isLast) {
@@ -222,13 +297,28 @@ export class SendQueue {
       promises.push(chain(async () => {
         this.#checkRate(chatKey);
         if (gap > 0) await sleep(gap);
-        // 发送去重：窗口期内 identical 文本跳过（防模型重复调用/超时重试造成的重复发言）
-        if (this.#isDuplicate(chatKey, text)) {
-          console.warn(`[sender] 跳过重复消息（${this.#dedupeWindow()}ms 内已发过相同内容）：${String(text).slice(0, 30)}`);
-          return { text, messageId: null, at: formatClockTime(Date.now()), deduped: true };
+        // 发送去重，两道闸：
+        //   ① 成功指纹窗口（同一内容确已发出）；
+        //   ② pending 占位窗口（上一次发送超时/中止，可能已经送达）—— D-1。
+        // 命中任一都跳过并留日志，绝不静默返回。
+        const pendingHit = this.#isPendingHit(chatKey, text);
+        if (this.#isDuplicate(chatKey, text) || pendingHit) {
+          console.warn(`[sender] 跳过重复消息（${pendingHit
+            ? `上一次发送结果不确定，${this.#unconfirmedWindow()}ms 内可能已送达`
+            : `${this.#dedupeWindow()}ms 内已发过相同内容`}）：${String(text).slice(0, 30)}`);
+          return {
+            text,
+            messageId: null,
+            at: formatClockTime(Date.now()),
+            deduped: true,
+            pending: pendingHit
+          };
         }
         // 出站硬上限：真正发到 QQ 的每一条都计入（@ 回复/AI 接话/提醒一视同仁）
         const gate = this.#reserveOutbound();
+        // D-1：**发出前**先登记占位。超时/中止类失败保留它（拦截后续重发），
+        // 成功或明确失败则释放（见下面的 catch）。
+        this.#markPending(chatKey, text);
         let data;
         try {
           data = await this.onebot.sendText(kind, id, text, {
@@ -237,10 +327,22 @@ export class SendQueue {
           });
         } catch (error) {
           gate.release();   // 失败不占额度（允许重试）
+          // 负向对照：修复关闭时保持旧行为（错误原样上抛，不做占位/分类）。
+          if (!FIX_SEND_IDEMPOTENCY) throw error;
+          if (this.#isUncertainSendError(error)) {
+            // 结果不确定：协议端可能已经收下并发出去了。保留占位，让后续重发被拦，
+            // 不要把这个错误报成"肯定没发出去"诱导模型再发一遍。
+            const win = this.#unconfirmedWindow();
+            console.warn(`[sender] 发送超时/中止但结果不确定（协议端可能已收下），保留 ${win}ms 去重占位，期间相同内容不再重发：${String(text).slice(0, 30)}`);
+            error.uncertain = true;
+          } else {
+            this.#clearPending(chatKey, text);   // 明确失败 → 释放占位，允许正常重试
+          }
           throw error;
         }
         gate.commit();
-        this.#markSent(chatKey, text);   // 只有 OneBot 成功返回后才记入去重窗口
+        this.#clearPending(chatKey, text);   // 成功：转成正式去重指纹
+        this.#markSent(chatKey, text);
         const ts = Date.now();
         this.store.appendSelf(chatKey, { text, ts, mid: data?.message_id ?? null });
         this.onSent?.({ chatKey, text, messageId: data?.message_id ?? null });

@@ -8,9 +8,8 @@
 # 代码与数据分离是热更新的前提：换代码只动 /opt/aichat/app，数据一个字节都不碰。
 #
 # ★ 启动顺序：NapCat 是 **__DEPLOY_USER__ 的用户级 unit**，本服务是系统单元，
-#   跨 manager 写不了依赖（After= 只在本 manager 内生效）。所以不声明依赖，
-#   改成靠 Restart=always + ExecStartPre 等 OneBot 就绪来收敛：
-#   NapCat 没起来时这里退不出启动，Restart 每 5 秒重试，直到 OneBot 应答。
+#   跨 manager 写不了依赖（After= 只在本 manager 内生效）。所以不声明依赖：
+#   启动前只做一次**有界**的 OneBot 预热探测，探到就继续、超时也继续（见 ExecStartPre）。
 [Unit]
 Description=AIChat QQ 群 AI 机器人（headless）
 After=network-online.target
@@ -28,9 +27,13 @@ Environment=NODE_ENV=production
 # 宿主默认 UTC，不指定就整体慢 8 小时 —— 注入提示词的【当前时间】、消息时间戳、
 # 日志时间、峰谷时段、提醒解析、按日分桶统统受影响。这里固定北京时间。
 Environment=TZ=Asia/Shanghai
-# 等 OneBot HTTP 就绪再起：最多等 180 秒，超时就让本次启动失败、交给 Restart 重试。
-# 这样 NapCat 慢一拍时不会出现「起了但连不上、之后再也不重连」的僵局。
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 180); do curl -sf -m 2 -o /dev/null http://127.0.0.1:3002/get_login_info && exit 0; sleep 1; done; echo "OneBot 180 秒内未就绪" >&2; exit 1'
+# 启动前有界探测 OneBot HTTP（最多约 5 秒），**任何情况都不许阻塞启动**（2026-10-20）：
+#   3002 只在 QQ 登录成功后才监听。QQ 登出态（未扫码）时这里若阻塞或失败，
+#   Restart=always 会无限重试 ⇒ 3210 永不监听 ⇒ 控制台打不开 ⇒ 用户连「扫码登录」
+#   的网页都进不去（自锁）。所以探到就继续，超时打印 WARN 也 exit 0。
+#   迟到的 OneBot 由代码侧自愈：src/app.js 每 2 秒探一次 OneBot 端口、端口一开立即重连，
+#   src/onebot.js 的连接循环无限退避重试 —— 不需要在这里把进程挡在门外等它。
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 5); do curl -sf -m 2 -o /dev/null http://127.0.0.1:3002/get_login_info && exit 0; sleep 1; done; echo "WARN: OneBot 未就绪，先起控制台（QQ 登录后会自动连上）" >&2; exit 0'
 ExecStart=/usr/bin/node src/server.js
 Restart=always
 RestartSec=5

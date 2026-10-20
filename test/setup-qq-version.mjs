@@ -106,19 +106,60 @@ check(SRC.includes('EXPECTED_CLIENT_BUILD'), '期望的 CLIENT_BUILD 由版本�
   }
 }
 
-// ── 6) 实跑 --check：应当报告协议栈真实版本 ──
+// ── 6) 实跑 --check：应当报告协议端状态 ──
 // （这一步是"真跑"，能发现函数名写错、模板串拼错这类只在运行时暴露的问题）
-try {
-  execFileSync(process.execPath, [path.join(ROOT, 'scripts', 'setup.mjs'), '--check'], {
-    cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000
-  });
-  // 也可能退出 0
-  ok('--check 可以正常运行');
-} catch (e) {
-  const out = String(e.stdout || '') + String(e.stderr || '');
-  check(out.includes('CLIENT_BUILD'),
-    '--check 会报告协议栈的 CLIENT_BUILD（排查版本问题时第一眼就能看到）',
-    out.slice(0, 400));
+//
+// --check 的输出/退出码取决于平台与安装状态，断言前提按两轴二分（每条分支都断言）：
+//   · 非 Windows（Linux 部署 = 外部协议端）：exit 0，且必须**明确说明协议端在外部**
+//     （含 deploy/napcat.container 与 HTTP 3002）；不得用「缺失」把外部模式报成失败。
+//   · Windows 且内置协议端就绪（exit 0）：必须报告协议栈 CLIENT_BUILD。
+//   · Windows 且未装（非零退出）：snowluma/index.mjs 存在则仍须报 CLIENT_BUILD；
+//     不存在则必须**明确报告 SnowLuma 缺失**（安装前状态）。
+// 曾经只有一条「out 必须含 CLIENT_BUILD」：未装 SnowLuma 时 --check 只报「缺失」就 exit 1，
+// 把「安装前状态」误判成「脚本坏了」，导致 npm test 链在这里断掉。
+function runSetupCheck() {
+  try {
+    const out = String(execFileSync(process.execPath, [path.join(ROOT, 'scripts', 'setup.mjs'), '--check'], {
+      cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000
+    }) ?? '');
+    return { code: 0, out };
+  } catch (e) {
+    return { code: e.status ?? 1, out: String(e.stdout || '') + String(e.stderr || '') };
+  }
+}
+{
+  const { code, out } = runSetupCheck();
+  if (process.platform !== 'win32') {
+    // Linux/容器部署：外部协议端模式。--check 是「部署就绪」检查，外部模式本来就绪 ⇒ exit 0；
+    // 等价强度要求：必须钉住脚本**明确说明了协议端形态**，不能沉默，也不能报「缺失」误导。
+    check(code === 0,
+      '--check 在非 Windows 平台 exit 0（外部协议端模式，不是失败）',
+      `exit=${code}\n${out.slice(0, 400)}`);
+    check(/外部/.test(out) && out.includes('deploy/napcat.container') && out.includes('3002'),
+      '--check 在非 Windows 平台明确报告协议端在外部（deploy/napcat.container + HTTP 3002）',
+      out.slice(0, 400));
+    check(!/缺失/.test(out),
+      '--check 在非 Windows 平台不再用「缺失」口径误导',
+      out.slice(0, 400));
+  } else if (code === 0) {
+    check(out.includes('CLIENT_BUILD'),
+      '--check 报告了协议栈 CLIENT_BUILD（本机已装 SnowLuma）',
+      out.slice(0, 400));
+  } else {
+    // 分支条件用 readClientBuild 自己的前提（snowluma/index.mjs），与脚本探测口径一致。
+    const canReadClientBuild = fs.existsSync(path.join(ROOT, 'snowluma', 'index.mjs'));
+    if (canReadClientBuild) {
+      check(out.includes('CLIENT_BUILD'),
+        '--check 报告了协议栈 CLIENT_BUILD（本机已装 SnowLuma）',
+        out.slice(0, 400));
+    } else {
+      // ⚠️ 必须按**同一行**匹配：输出里紧跟着还有「便携 QQ: ❌ 缺失」，
+      // 若只写成 out.includes('缺失')，SnowLuma 的提示被改坏时会被下一行串行蒙混过去。
+      check(/SnowLuma:[^\n]*缺失/.test(out),
+        '--check 明确报告 SnowLuma 缺失（本机未装，属安装前状态）',
+        out.slice(0, 400));
+    }
+  }
 }
 
 // ── 6b) 安装器类型识别（纯函数）──────────────────────────────────────

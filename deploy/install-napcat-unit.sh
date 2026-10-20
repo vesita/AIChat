@@ -57,9 +57,11 @@ log "4) 让 quadlet 生成单元并启动"
 sudo -u "$OWNER" XDG_RUNTIME_DIR="/run/user/$(id -u "$OWNER")" \
   systemctl --user daemon-reload || die "daemon-reload 失败" 1
 # 先删掉手工创建的容器，交给 systemd 管（否则同名冲突）
+# 必须带 --time：podman rm -f 默认只等 10 秒就 SIGKILL，而 QQ 不响应 SIGTERM，
+# 登录态来不及落盘 —— 下次启动就得扫码。与 quadlet 的 StopTimeout 取同一量级。
 if sudo -u "$OWNER" podman container exists napcat 2>/dev/null; then
   log "   移除手工创建的容器（登录态在挂载卷里，不受影响）"
-  sudo -u "$OWNER" podman rm -f napcat >/dev/null 2>&1 || true
+  sudo -u "$OWNER" podman rm -f --time 80 napcat >/dev/null 2>&1 || true
 fi
 sudo -u "$OWNER" XDG_RUNTIME_DIR="/run/user/$(id -u "$OWNER")" \
   systemctl --user enable --now napcat.service || die "启动 napcat.service 失败" 1

@@ -13,7 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { getConfig, updateConfig, deepMerge as deepMergeConfig, DATA_DIR } from './config.js';
+import { getConfig, updateConfig, deepMerge as deepMergeConfig, DATA_DIR, PROTOCOL_MODE } from './config.js';
 import { customSearch } from './web-search.js';
 import { listModels, chatCompletion, resolveApiKey, estimateCost, cacheHitRate } from './llm.js';
 import { resolveOfficialPrice, listOfficialPrices } from './model-prices.js';
@@ -46,8 +46,11 @@ export function createRoutes(deps) {
     localVersion, compareSemver, UPDATE_INFO_URL,
     sanitizeConfig, keyEndpointAllowed, sanitizeProvider,
     readBody, authorize,
+    qqLoginHandlers,
     snowlumaDir, snowlumaWsPort, snowlumaWebuiUrl, snowlumaStatus, snowlumaLogs,
     launchSnowluma, stopSnowluma,
+    // 协议端形态唯一判定点（config.resolveProtocolMode 的装配面）+ HTTP 数据面探针快照
+    protocolMode, httpDataPathStatus,
     qqPortableStatus, qqPortableLogs, launchPortableQQ, stopPortableQQ,
     visionScan,
     buildUsageStats, buildUsageBreakdown,
@@ -58,6 +61,37 @@ export function createRoutes(deps) {
   // 但 readBody 明确标记的可暴露错误（400 非法 JSON / 413 过大）必须透传，
   // 否则会从"应返回 400"退化成静默当成空 patch。
   const bodyOf = (req) => readBody(req).catch((e) => { if (e?.expose) throw e; return {}; });
+
+  // ── X1：「打开目录/网页」类动作的平台闸与 spawn 收口 ────────────────────
+  //
+  // 背景：这三个端点曾无条件 spawn('explorer.exe'/'cmd.exe')，Linux 上可执行文件
+  // 不存在 ⇒ spawn 异步发 'error' 事件；没有监听 ⇒ uncaughtException ⇒
+  // src/server.js 的 process.exit(1)（Restart=always 会重启，但会话全丢）。
+  // try/catch 抓不到异步事件，所以：①非 win32 直接 400，不 spawn；②唯一 spawn
+  // 出口 spawnDetached 一定挂 error 监听 —— 结构上不再存在无监听的 spawn 路径。
+  function platformCanOpenNativeUi() {
+    return process.platform === 'win32';
+  }
+
+  /** 唯一的"外部程序打开"出口：所有 spawn 都从这里走，error 事件必被消费。 */
+  function spawnDetached(command, args, label) {
+    const child = spawn(command, args, { detached: true, stdio: 'ignore' });
+    child.on('error', (error) => {
+      // 不是静默 catch：异步失败必须留下可检索的记录（响应已经返回，无法再改状态码）。
+      log(`[${label}] 打开动作失败（${command}）：${error?.message ?? error}`);
+    });
+    child.unref();
+    return child;
+  }
+
+  /** 外部协议端模式的统一 409 说明（启停/打开等管理动作不归本应用做）。 */
+  function externalModeConflict(mode) {
+    return {
+      ok: false,
+      mode: mode.mode,
+      error: `外部协议端模式：本应用不管理协议端（由外部提供，如 NapCat 容器）。${mode.reason}`
+    };
+  }
 
   /**
    * Skill 可用性判断的运行期上下文。
@@ -101,13 +135,37 @@ export function createRoutes(deps) {
           deps.isPortOpen('127.0.0.1', webuiPort),
           deps.isPortOpen('127.0.0.1', snowlumaWsPort())
         ]);
-        // 诊断：把"连不上"拆成三种用户能看懂的原因（给 UI 就绪度体检用）。
+        // 协议端形态（唯一判定点）+ 两种红灯分开取：
+        //   dataPath* = 僵尸态自检（task-6，get_csrf_token 判据，判"数据通道死没死"）
+        //   http*     = HTTP 数据面探针（本次，判"HTTP 是不是 OneBot"，不判登录态）
+        const protocol = protocolMode();
+        const dataPath = onebot.dataPathStatus();
+        const http = httpDataPathStatus();
+        // 诊断：把"连不上"拆成用户能看懂的原因（给 UI 就绪度体检用）。
+        // 外部协议端模式下不许再把人引向"SnowLuma 页签启动"——那条路必定失败。
         let onebotDiagnosis = '';
         if (!onebot.connected) {
-          if (!slRunning) onebotDiagnosis = 'SnowLuma 未运行：请到 SnowLuma 页签启动';
-          else if (!obPortOpen) onebotDiagnosis = 'SnowLuma 已运行但无账号登录：请在 QQ 里完成登录（登录后数秒内会自动连上）';
-          else if (String(onebot.lastConnectError || '').includes('401')) onebotDiagnosis = '访问令牌不匹配：正在自动轮换重试，若持续出现请在设置里核对 OneBot 令牌';
-          else onebotDiagnosis = onebot.lastConnectError ? `连接失败：${String(onebot.lastConnectError).slice(0, 120)}` : '连接中…';
+          if (protocol.mode === PROTOCOL_MODE.EXTERNAL) {
+            onebotDiagnosis = obPortOpen
+              ? '协议端（NapCat 容器）已监听但未登录：请在 QQ 里完成扫码登录（登录后数秒内会自动连上）'
+              : '协议端（NapCat 容器）未运行或未登录：检查 systemctl --user status napcat.service，并在 QQ 里完成扫码登录';
+            if (String(onebot.lastConnectError || '').includes('401')) {
+              onebotDiagnosis = '访问令牌不匹配：请在设置里核对 OneBot 令牌（外部协议端模式下没有内置令牌候选可轮换）';
+            }
+          } else if (protocol.mode === PROTOCOL_MODE.UNCONFIGURED) {
+            onebotDiagnosis = `协议端未配置：${protocol.reason}`;
+          } else if (!slRunning) {
+            onebotDiagnosis = 'SnowLuma 未运行：请到 SnowLuma 页签启动';
+          } else if (!obPortOpen) {
+            onebotDiagnosis = 'SnowLuma 已运行但无账号登录：请在 QQ 里完成登录（登录后数秒内会自动连上）';
+          } else if (String(onebot.lastConnectError || '').includes('401')) {
+            onebotDiagnosis = '访问令牌不匹配：正在自动轮换重试，若持续出现请在设置里核对 OneBot 令牌';
+          } else {
+            onebotDiagnosis = onebot.lastConnectError ? `连接失败：${String(onebot.lastConnectError).slice(0, 120)}` : '连接中…';
+          }
+        } else if (http.ok === false) {
+          // 半通：WS 绿、HTTP 坏 ⇒ 机器人收得到、回不出去。这是最危险、也最容易漏报的形态。
+          onebotDiagnosis = `WS 已连但 HTTP 数据面不可用：检查 snowluma.httpUrl（${http.error}）`;
         }
         return json(res, 200, {
           onebot: {
@@ -115,7 +173,26 @@ export function createRoutes(deps) {
             everConnected: onebot.everConnected,
             error: onebot.lastConnectError,
             diagnosis: onebotDiagnosis,
-            self: onebot.selfInfo ? { userId: onebot.selfId, nickname: onebot.selfNickname } : null
+            self: onebot.selfInfo ? { userId: onebot.selfId, nickname: onebot.selfNickname } : null,
+            // 僵尸态自检（task-6）：三态 + 判据理由 + 时间戳；ok 的 null = 尚未探过
+            dataPathState: dataPath.state,
+            dataPathOk: dataPath.ok,
+            dataPathReason: dataPath.reason,
+            lastProbeAt: dataPath.lastProbeAt,
+            lastInboundAt: dataPath.lastInboundAt,
+            probeCount: dataPath.probeCount,
+            // HTTP 数据面探针（本次）：只判「HTTP 像不像 OneBot」，不判登录态/僵尸态
+            httpOk: http.ok,
+            httpError: http.error,
+            httpProbeUrl: http.url,
+            httpProbeAt: http.checkedAt
+          },
+          // 协议端形态（外部协议端模式唯一判定点的对外投影）
+          protocol: {
+            mode: protocol.mode,
+            reason: protocol.reason,
+            wsPort: protocol.wsPort,
+            httpPort: protocol.httpPort
           },
           snowluma: {
             dir: snowlumaDir(),
@@ -138,8 +215,16 @@ export function createRoutes(deps) {
     {
       method: 'POST', pattern: '/api/open-data-dir',
       handler: async ({ res, json }) => {
+        // X1 平台闸：Windows 可执行文件只在 Windows 上 spawn（非 win32 直接 400，
+        // 连 spawn 都不发生，结构上不可能再触发 uncaughtException）。
+        if (!platformCanOpenNativeUi()) {
+          return json(res, 400, {
+            ok: false,
+            error: `非 Windows 平台：不能在服务器上打开系统文件夹。请用 SSH 或文件管理器查看 ${DATA_DIR}`
+          });
+        }
         try {
-          spawn('explorer.exe', [DATA_DIR], { detached: true, stdio: 'ignore' }).unref();
+          spawnDetached('explorer.exe', [DATA_DIR], 'open-data-dir');
           return json(res, 200, { ok: true, dir: DATA_DIR });
         } catch (error) {
           return json(res, 500, { ok: false, error: String(error?.message ?? error) });
@@ -237,10 +322,12 @@ export function createRoutes(deps) {
       }
     },
 
-    // ── SnowLuma 进程管理 ────────────────────────────────────────────
+    // ── SnowLuma 进程管理（外部协议端模式下统一 409）──────────────────
     {
       method: 'POST', pattern: '/api/snowluma/launch',
       handler: async ({ res, json }) => {
+        const protocol = protocolMode();
+        if (protocol.mode === PROTOCOL_MODE.EXTERNAL) return json(res, 409, externalModeConflict(protocol));
         try {
           const result = await launchSnowluma();
           return json(res, result.ok ? 200 : 400, result);
@@ -256,9 +343,13 @@ export function createRoutes(deps) {
     {
       method: 'POST', pattern: '/api/snowluma/stop',
       handler: async ({ res, json }) => {
+        const protocol = protocolMode();
+        if (protocol.mode === PROTOCOL_MODE.EXTERNAL) return json(res, 409, externalModeConflict(protocol));
         try {
-          const stopped = stopSnowluma();
-          return json(res, 200, { ok: true, stopped, embedded: snowlumaStatus().embedded, pid: snowlumaStatus().pid });
+          // ⚠️ 必须 await：以前直接把 Promise 塞进 JSON，序列化成 stopped:{}（真值），
+          // 实际没杀任何进程却报成功（audit P3）。
+          const stopped = await stopSnowluma();
+          return json(res, 200, { ok: true, stopped: stopped === true, embedded: snowlumaStatus().embedded, pid: snowlumaStatus().pid });
         } catch (error) {
           return json(res, 500, { ok: false, error: String(error?.message ?? error) });
         }
@@ -267,18 +358,37 @@ export function createRoutes(deps) {
     {
       method: 'POST', pattern: '/api/snowluma/open-folder',
       handler: async ({ res, json }) => {
+        // X1：非 win32 一律 400、不 spawn（explorer.exe 在 Linux 上不存在，
+        // spawn 的异步 error 事件没有监听就是进程退出）。
+        if (!platformCanOpenNativeUi()) {
+          return json(res, 400, {
+            ok: false,
+            error: `非 Windows 平台：不能打开系统文件夹。请用 SSH 或文件管理器查看 ${snowlumaDir() || '（SnowLuma 目录未配置；外部协议端请查看容器挂载目录）'}`
+          });
+        }
+        const protocol = protocolMode();
+        if (protocol.mode === PROTOCOL_MODE.EXTERNAL) return json(res, 409, externalModeConflict(protocol));
         const dir = snowlumaDir();
         if (!dir) return json(res, 400, { ok: false, error: '找不到 SnowLuma 目录' });
-        spawn('explorer.exe', [dir], { detached: true, stdio: 'ignore' }).unref();
+        spawnDetached('explorer.exe', [dir], 'snowluma/open-folder');
         return json(res, 200, { ok: true });
       }
     },
     {
       method: 'POST', pattern: '/api/snowluma/open-webui',
       handler: async ({ res, json }) => {
+        // X1：同 open-folder，非 win32 不许 spawn cmd.exe。
+        if (!platformCanOpenNativeUi()) {
+          return json(res, 400, {
+            ok: false,
+            error: `非 Windows 平台：不能在服务器上打开浏览器窗口。请用 SSH 端口转发后在本地打开 ${snowlumaWebuiUrl() || '（SnowLuma WebUI 地址未发现）'}`
+          });
+        }
+        const protocol = protocolMode();
+        if (protocol.mode === PROTOCOL_MODE.EXTERNAL) return json(res, 409, externalModeConflict(protocol));
         const webuiUrl = snowlumaWebuiUrl();
         if (!webuiUrl) return json(res, 400, { ok: false, error: '没有找到 SnowLuma WebUI 地址（等日志出现 listening 后再试）' });
-        spawn('cmd.exe', ['/c', 'start', '', webuiUrl], { detached: true, stdio: 'ignore' }).unref();
+        spawnDetached('cmd.exe', ['/c', 'start', '', webuiUrl], 'snowluma/open-webui');
         return json(res, 200, { ok: true, webuiUrl });
       }
     },
@@ -1573,6 +1683,30 @@ export function createRoutes(deps) {
         }
         return undefined;   // 已自行写响应
       }
+    },
+    // ── QQ 扫码登录（/api/qq-login/*）────────────────────────────────────
+    // 鉴权：走 handleHttp 对全部 /api/* 的统一门（authorize + originAllowed）；
+    // 回环门：在 handler 内（createQQLoginHandlers 的 guard，单实现点）。
+    // POST 先 bodyOf 读干净请求体（keep-alive 复用），handler 本身不解析 body。
+    {
+      method: 'GET', pattern: '/api/qq-login/status',
+      handler: (ctx) => qqLoginHandlers.status(ctx)
+    },
+    {
+      method: 'POST', pattern: '/api/qq-login/start',
+      handler: async (ctx) => { await bodyOf(ctx.req); return qqLoginHandlers.start(ctx); }
+    },
+    {
+      method: 'POST', pattern: '/api/qq-login/refresh',
+      handler: async (ctx) => { await bodyOf(ctx.req); return qqLoginHandlers.refresh(ctx); }
+    },
+    {
+      method: 'GET', pattern: '/api/qq-login/qrcode.svg',
+      handler: (ctx) => qqLoginHandlers.qrcode(ctx)
+    },
+    {
+      method: 'DELETE', pattern: '/api/qq-login/session',
+      handler: (ctx) => qqLoginHandlers.session(ctx)
     },
   ];
 }

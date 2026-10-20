@@ -52,7 +52,7 @@ botName / selfNickname 任何层都不许覆盖（账号身份，换了会与 @ 
 | 10 | 【可用技能】 | renderSkillSections() | **动态**：启用插件的 manifest prompt.sections + 运行时 promptSections(context) + extraSections（主人规则 p72），按 priority 降序（上限 99） |
 | 11 | 【管理员附加规则】 | customRules | 有才拼 |
 
-**覆盖模式**（persona.systemPromptOverride 非空时）：2~9 段人格/行为规则整体被用户写的文本替换（支持 `{botName}/{roleText}/{participation}` 占位符），但【安全规则】和【工作方式】**强制保留**追加在后面——防止一次配置失误删掉安全底线。
+**覆盖模式**（persona.systemPromptOverride 非空时）：只替换 2~9 段里的**人格/风格类准则**（支持 `{botName}/{roleText}/{participation}` 占位符）；【安全规则】【工作方式】和**机制段**（当前为【轻量记忆】`memoryRules()`，见 `mechanismSections()`）**强制保留**并追加在后面。机制段描述的是「这套程序怎么运转」，不属于人格，override 不允许把它们一起换掉——否则一次配置误用就能删掉安全底线或记忆维护规则。两分支的机制段由 `test/memory-portrait-test.mjs` 同套断言守卫。
 
 当前有静态 prompt.sections 的扩展（develop/）：
 

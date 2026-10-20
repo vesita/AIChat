@@ -9,6 +9,96 @@ const RECONNECT_MAX_MS = 30000;
 // 连上 WS 但 get_login_info 失败（SnowLuma 还在启动/账号还没挂好）时的补拉间隔。
 const SELF_INFO_RETRY_MS = 15000;
 
+// ── 数据通道探活（僵尸态自检）────────────────────────────────────────────
+//
+// 背景（2026-10-20 线上实测，见 doc/audit/core-faults.md 的 Z-1）：QQ 服务端作废
+// 登录态后，WS 还连着、OneBot 心跳照发，`get_login_info` / `get_status` 仍返回
+// online:true —— 它们**会撒谎**，是那晚「界面全绿、消息不流动」的根因。真正能证明
+// 数据通道活着的是走服务器往返的 `get_csrf_token`（实测 238–309ms；僵尸态下返回
+// {"status":"failed","message":"getClientKey Error"}）；僵尸态下 `get_friend_list`
+// 同时返回 []。
+//
+// 判据分层（见 judgeDataPath，唯一决策点）：
+//   第一判据  get_csrf_token   —— HTTP 打不通 ⇒ unreachable；failed / 空 token ⇒ zombie
+//   佐证      get_friend_list  —— csrf 正常但好友列表为空 ⇒ zombie
+//   ❌ 禁用    get_login_info / get_status —— 僵尸态下照样报 online:true，会把故障抹平
+//
+// 探活只在「可疑」时发生（见 shouldProbeDataPath）：距最近一次入站消息 ≥ idleMs、
+// 且距上一次探活 ≥ intervalMs 才发一次；消息在流动时**一个请求都不发**。
+// 发现异常后只观测、只上报（状态位 + 固定格式日志 + 监听器），不重连、不重启、
+// 不触发扫码/登出 —— 自动恢复动作留给人工或外部 watchdog 决定。
+export const DATA_PATH_STATE = Object.freeze({
+  UNKNOWN: 'unknown',          // 还没探过：刚连上 / 刚断开
+  OK: 'ok',                    // csrf ok（token 非空）且好友列表非空
+  ZOMBIE: 'zombie',            // HTTP 打得通，但 csrf failed / 空 token / 好友列表为空
+  UNREACHABLE: 'unreachable'   // OneBot HTTP 完全打不通（fetch 抛错）
+});
+
+// 默认值即规范：10 分钟无入站消息才算可疑，探活最小周期 5 分钟。
+// 测试注入小值只为缩短等待；生产不传这两个参数，走默认。
+export const PROBE_IDLE_MS = 600000;
+export const PROBE_INTERVAL_MS = 300000;
+export const PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * 入站活性的唯一口径：只有 post_type=message 才算。
+ * meta_event（心跳）在僵尸态照发，拿它当活性会永久掩盖故障 —— 这是 Z-1 的教训。
+ */
+export function isInboundMessageEvent(event) {
+  return !!event && typeof event === 'object' && event.post_type === 'message';
+}
+
+/**
+ * 探活时机（纯函数，策略只有这一处）。
+ *
+ * 三个条件同时成立才返回 true：
+ *   · 有连接起点（connectedAt）：没连上就没有"静默"可言；
+ *   · 距最近一次入站消息 ≥ idleMs（从没收到过消息则从连上那一刻算起）；
+ *   · 距上一次探活 ≥ intervalMs（还没探过则不受此限）。
+ */
+export function shouldProbeDataPath({ now, connectedAt = 0, lastInboundAt = 0, lastProbeAt = 0, idleMs = PROBE_IDLE_MS, intervalMs = PROBE_INTERVAL_MS } = {}) {
+  const idleFrom = lastInboundAt || connectedAt;
+  if (!idleFrom) return false;
+  if (now - idleFrom < idleMs) return false;
+  if (lastProbeAt && now - lastProbeAt < intervalMs) return false;
+  return true;
+}
+
+/**
+ * 判据分层（纯函数，唯一决策点）。
+ *
+ * sample = {
+ *   csrf:    { reachable, ok, token, error? },              // get_csrf_token 的结果
+ *   friends: { reachable, ok, list, error? } | null          // csrf 失败时不请求，传 null
+ * }
+ * 返回 { state, reason }；reason 进日志与状态面，排障时不用猜。
+ *
+ * ⚠️ 这里**不许**出现 get_login_info / get_status 的字段当判据：它们在僵尸态
+ * 仍返回 online:true，会把"数据通道已死"判成"一切正常"。
+ */
+export function judgeDataPath({ csrf, friends = null } = {}) {
+  if (!csrf || csrf.reachable !== true) {
+    return { state: DATA_PATH_STATE.UNREACHABLE, reason: `OneBot HTTP 打不通：${csrf?.error || '未知网络错误'}` };
+  }
+  if (csrf.ok !== true) {
+    return { state: DATA_PATH_STATE.ZOMBIE, reason: `get_csrf_token failed：${csrf.error || '无详情'}` };
+  }
+  if (!csrf.token) {
+    return { state: DATA_PATH_STATE.ZOMBIE, reason: 'get_csrf_token 返回空 token' };
+  }
+  if (friends && friends.reachable === true && friends.ok === true && Array.isArray(friends.list) && friends.list.length === 0) {
+    return { state: DATA_PATH_STATE.ZOMBIE, reason: 'get_friend_list 为空（数据通道佐证已死）' };
+  }
+  const friendNote = !friends
+    ? '未取好友列表'
+    : friends.reachable !== true
+      ? `好友列表取不到（${friends.error || '网络错误'}）`
+      : friends.ok !== true
+        ? `好友列表动作失败（${friends.error || '无详情'}）`
+        : `好友 ${friends.list?.length ?? 0} 条`;
+  return { state: DATA_PATH_STATE.OK, reason: `get_csrf_token ok，${friendNote}` };
+}
+
 /**
  * 正文 @ 规范化：把 `@昵称` 补成 `@昵称(QQ:xxx)`。
  * 走 `message.inline-at-normalize` 能力；没有提供者（Skill 未启用）时返回 null，
@@ -82,7 +172,7 @@ function describeCause(error, depth = 0) {
 }
 
 export class OneBotClient {
-  constructor({ wsUrl, httpUrl, accessToken, httpToken, onEvent }) {
+  constructor({ wsUrl, httpUrl, accessToken, httpToken, onEvent, probeIdleMs, probeIntervalMs, probeTimeoutMs, probeHttpUrl, probeFetch } = {}) {
     this.wsUrl = String(wsUrl || 'ws://127.0.0.1:3001');
     this.httpUrl = String(httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
     this.accessToken = String(accessToken || '');
@@ -96,6 +186,13 @@ export class OneBotClient {
     this.selfInfo = null;      // { user_id, nickname }
     this.#closedByUs = false;
     this.statusListeners = new Set();
+    // 数据通道探活配置：端点从 httpUrl 派生（probeHttpUrl 可整体覆盖），fetch 实现
+    // 可注入 —— 测试用本地 stub 服务模拟三种响应，绝不打真 QQ 接口。
+    this.probeIdleMs = Number.isFinite(probeIdleMs) && probeIdleMs > 0 ? Math.floor(probeIdleMs) : PROBE_IDLE_MS;
+    this.probeIntervalMs = Number.isFinite(probeIntervalMs) && probeIntervalMs > 0 ? Math.floor(probeIntervalMs) : PROBE_INTERVAL_MS;
+    this.probeTimeoutMs = Number.isFinite(probeTimeoutMs) && probeTimeoutMs > 0 ? Math.floor(probeTimeoutMs) : PROBE_TIMEOUT_MS;
+    this.probeHttpUrl = probeHttpUrl ? String(probeHttpUrl).replace(/\/+$/, '') : '';
+    this.probeFetch = typeof probeFetch === 'function' ? probeFetch : null;
   }
 
   #closedByUs;
@@ -103,6 +200,14 @@ export class OneBotClient {
   #connectGeneration = 0;  // 连接循环代际号：新循环启动即作废旧循环（防并发僵尸循环）
   #reconnectTimer = null;  // 待执行的重连定时器（close/reconnect 时要清，防泄漏）
   #selfInfoTimer = null;   // get_login_info 延迟补拉定时器
+  #probeTimer = null;      // 探活节拍定时器（连接建立后才有）
+  #probeInFlight = false;  // 同一时刻只跑一次探活（HTTP 往返可能慢于节拍）
+  #probeConnectedAt = 0;   // 本次连接的起点（没收到过消息时以它为"静默起点"）
+  #lastInboundAt = 0;      // 最近一次入站消息（post_type=message）时间
+  #lastProbeAt = 0;        // 最近一次探活时间
+  #probeCount = 0;         // 本次连接内已探活次数
+  #probeResult = { state: DATA_PATH_STATE.UNKNOWN, reason: '尚未探活' };
+  #dataPathListeners = new Set();
 
   onStatus(fn) {
     this.statusListeners.add(fn);
@@ -134,6 +239,8 @@ export class OneBotClient {
     // 表现为"切了正确令牌也要等半分钟才试"，多账号轮换恢复被人为拖慢。
     this.#failedAttempts = 0;
     if (this.#reconnectTimer) { clearTimeout(this.#reconnectTimer); this.#reconnectTimer = null; }
+    // 旧连接作废：探活结论也一并作废，等新连接建立后重新判定。
+    this.#endDataPathSession();
     try { old?.close(); } catch { /* ignore */ }
     this.#connectLoop();
   }
@@ -203,6 +310,8 @@ export class OneBotClient {
       this.lastConnectError = '';
       this.#failedAttempts = 0;   // 连上了，退避计数清零
       this.#setStatus(true);
+      // 数据通道自检随连接启动：只在静默可疑时探活，发现僵尸态只上报。
+      this.#startDataPathSession();
       try {
         this.selfInfo = await this.call('get_login_info');
       } catch (error) {
@@ -218,10 +327,14 @@ export class OneBotClient {
       let event = null;
       try { event = JSON.parse(String(data)); } catch { return; }
       if (!event || typeof event !== 'object') return;
+      // 入站活性只认消息事件：心跳在僵尸态照发，不能当判据（见 isInboundMessageEvent）。
+      if (isInboundMessageEvent(event)) this.#lastInboundAt = Date.now();
       try { this.onEvent(event); } catch (error) { console.error('[onebot] 事件处理出错:', error); }
     });
     socket.on('close', () => {
       if (!isCurrent(socket)) return; // 旧连接的迟到 close：新连接已在处理
+      // 断开后停止探活：判的是"连着的数据通道"，没连接就没有结论。
+      this.#endDataPathSession();
       this.#setStatus(false);
       if (!this.#closedByUs) {
         // 指数退避：长断线时 3 秒一次的重试风暴既刷屏又占资源；
@@ -259,10 +372,153 @@ export class OneBotClient {
     this.#closedByUs = true;
     if (this.#reconnectTimer) { clearTimeout(this.#reconnectTimer); this.#reconnectTimer = null; }
     if (this.#selfInfoTimer) { clearTimeout(this.#selfInfoTimer); this.#selfInfoTimer = null; }
+    this.#endDataPathSession();
     const old = this.socket;
     this.socket = null;
     try { old?.close(); } catch { /* ignore */ }
     this.#setStatus(false);
+  }
+
+  // ── 数据通道探活（僵尸态自检）：对外只读面 + 内部节拍 ────────────────────
+
+  /** 订阅数据通道状态变化（上报用；/api/status 也可直接读 dataPathStatus()）。 */
+  onDataPathChange(fn) {
+    this.#dataPathListeners.add(fn);
+    return () => this.#dataPathListeners.delete(fn);
+  }
+
+  /**
+   * 数据通道状态快照：三态 + 判据理由 + 时间戳一次取齐，外部只读这一处。
+   *
+   * `ok` 三义分明：ok ⇒ true；zombie/unreachable ⇒ false；**尚未探过 ⇒ null**。
+   * "没判过"绝不与"判过是坏"共用一个 false（否则刚连上就显示"数据通道坏了"）。
+   */
+  dataPathStatus() {
+    const state = this.#probeResult.state;
+    return {
+      state,
+      ok: state === DATA_PATH_STATE.OK ? true : (state === DATA_PATH_STATE.UNKNOWN ? null : false),
+      reason: this.#probeResult.reason,
+      lastProbeAt: this.#lastProbeAt || null,
+      lastInboundAt: this.#lastInboundAt || null,
+      probeCount: this.#probeCount
+    };
+  }
+
+  #startDataPathSession() {
+    this.#endDataPathSession();
+    this.#probeConnectedAt = Date.now();
+    this.#lastInboundAt = 0;
+    this.#lastProbeAt = 0;
+    this.#probeCount = 0;
+    this.#probeResult = { state: DATA_PATH_STATE.UNKNOWN, reason: '刚建立连接，等待探活时机' };
+    // 节拍取 idle 与 interval 的较小者：只在"可能该探"的时刻醒来，醒来后仍由
+    // shouldProbeDataPath 复核 —— 宁可晚一轮发现，也不给协议端多发一个请求。
+    const tickMs = Math.max(20, Math.min(this.probeIdleMs, this.probeIntervalMs));
+    const timer = setInterval(() => this.#dataPathTick(), tickMs);
+    timer.unref?.();
+    this.#probeTimer = timer;
+  }
+
+  #endDataPathSession() {
+    if (this.#probeTimer) { clearInterval(this.#probeTimer); this.#probeTimer = null; }
+    this.#probeConnectedAt = 0;
+    if (this.#probeResult.state !== DATA_PATH_STATE.UNKNOWN) {
+      this.#probeResult = { state: DATA_PATH_STATE.UNKNOWN, reason: '连接已断开' };
+    }
+  }
+
+  #dataPathTick() {
+    if (this.#closedByUs || !this.connected || this.#probeInFlight) return;
+    const now = Date.now();
+    if (!shouldProbeDataPath({
+      now,
+      connectedAt: this.#probeConnectedAt,
+      lastInboundAt: this.#lastInboundAt,
+      lastProbeAt: this.#lastProbeAt,
+      idleMs: this.probeIdleMs,
+      intervalMs: this.probeIntervalMs
+    })) return;
+    this.#probeInFlight = true;
+    this.#runDataPathProbe(now)
+      .catch((error) => { console.warn('[onebot][probe] 探活自身出错（不影响连接）:', error?.message ?? error); })
+      .finally(() => { this.#probeInFlight = false; });
+  }
+
+  /**
+   * 一次探活：先第一判据，通过后才取好友佐证（csrf 已 failed 时不再多发请求）。
+   * 只产生结论，不产生任何连接动作 —— 不变量 4（不自动重启/不扫码）的强制点。
+   */
+  async #runDataPathProbe(now) {
+    this.#lastProbeAt = now;
+    this.#probeCount++;
+    const csrf = await this.#probeAction('get_csrf_token');
+    const friends = csrf.reachable === true && csrf.ok === true && csrf.token
+      ? await this.#probeAction('get_friend_list')
+      : null;
+    if (!this.connected) return;   // 探活期间连接断了：结论作废，不广播
+    const verdict = judgeDataPath({ csrf, friends });
+    this.#publishDataPath(verdict.state, verdict.reason);
+  }
+
+  #publishDataPath(state, reason) {
+    const prev = this.#probeResult.state;
+    this.#probeResult = { state, reason };
+    // 固定格式日志：journalctl / 外部 watchdog 按 `[onebot][probe]` 前缀捞。
+    // 只告警不上手：不调用 reconnect()/close()，不触发扫码/登出。
+    if (state === DATA_PATH_STATE.ZOMBIE) {
+      console.warn(`[onebot][probe] 数据通道僵尸态（${reason}）—— 只上报，不自动重启/不触发扫码`);
+    } else if (state === DATA_PATH_STATE.UNREACHABLE) {
+      console.warn(`[onebot][probe] 数据通道不可达（${reason}）—— 只上报，不自动重启/不触发扫码`);
+    } else if (state === DATA_PATH_STATE.OK && prev !== DATA_PATH_STATE.OK) {
+      console.log(`[onebot][probe] 数据通道正常（${reason}）`);
+    }
+    for (const fn of this.#dataPathListeners) {
+      try { fn(this.dataPathStatus()); } catch { /* 监听方出错不影响探活 */ }
+    }
+  }
+
+  /**
+   * 探活专用 HTTP 调用：端点派生自 httpUrl（可被 probeHttpUrl 覆盖），fetch 实现
+   * 可被 probeFetch 替换 —— 测试用本地 stub 服务模拟四种响应，绝不打真 QQ 接口。
+   *
+   * 返回 { reachable, ok, token, list, error }：
+   *   reachable=false ⇒ fetch 抛错（HTTP 打不通）⇒ unreachable
+   *   reachable=true 但 ok=false ⇒ 打得通、动作失败 ⇒ zombie（判据在 judgeDataPath）
+   */
+  async #probeAction(action) {
+    const base = String(this.probeHttpUrl || this.httpUrl || '').replace(/\/+$/, '');
+    const fetchImpl = this.probeFetch || globalThis.fetch;
+    const timeoutMs = Math.max(1, Number(this.probeTimeoutMs) || PROBE_TIMEOUT_MS);
+    if (!base) return { reachable: false, ok: false, error: '未配置 httpUrl' };
+    if (typeof fetchImpl !== 'function') return { reachable: false, ok: false, error: '当前运行环境没有 fetch' };
+    const token = String(this.httpToken || '');
+    let res;
+    try {
+      res = await fetchImpl(`${base}/${action}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(token ? { authorization: `Bearer ${token}` } : {})
+        },
+        body: '{}',
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+    } catch (error) {
+      // 只有"HTTP 打不通"才算 unreachable；反面是"打得通但动作失败"= zombie。
+      return { reachable: false, ok: false, error: describeCause(error) };
+    }
+    let body = null;
+    try { body = await res.json(); } catch { body = null; }
+    const ok = res.ok === true && !!body && body.status === 'ok';
+    const data = body?.data;
+    return {
+      reachable: true,
+      ok,
+      token: action === 'get_csrf_token' && typeof data === 'string' ? data : '',
+      list: action === 'get_friend_list' && Array.isArray(data) ? data : null,
+      error: ok ? '' : `HTTP ${res.status}${body?.status ? ` status=${body.status}` : ''}${body?.message ? ` ${body.message}` : ''}`.trim()
+    };
   }
 
   /** OneBot HTTP API（发送与查询都走这里）。 */

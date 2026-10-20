@@ -19,7 +19,7 @@
 4. 处理期间新来的消息只写存档；本次结束后发现未读 → 自动再开新会话，直到清空
 5. 长期信息走记忆工具持久化，跨运行生效
 **整体组成**
-- **协议端**：通过 OneBot v11 正向 WebSocket 接 QQ（默认配 SnowLuma，任何兼容协议端均可换）
+- **协议端**：通过 OneBot v11 接 QQ（Windows 桌面版默认配 SnowLuma，任何兼容协议端均可换）。Linux/容器部署用外部 NapCat：**WS `127.0.0.1:3001`** + **HTTP API `127.0.0.1:3002`** 两个地址都要填（`snowluma.wsUrl` / `snowluma.httpUrl`）——只填 ws 不填 http 是最常见的半通故障：WS 绿、发送 404
 - **大脑**：任意 OpenAI 兼容 API——官方 / 中转站 / 本地网关均可，模型在设置里自选
 - **桌面壳**：Electron，托盘常驻、开机自启、关窗不退出、端口被占自动让位
 - **控制台**：零框架原生 HTML/CSS/JS，明暗双主题 + 跟随系统，带完整设计 token 体系
@@ -45,6 +45,7 @@
 - 托盘常驻 / 开机自启 / 关窗不退出；明暗主题；版本更新检查（发现新版本时直接提示）
 **OneBot**
 - 协议端地址可改，适配任何 OneBot v11 实现
+- WS 与 HTTP 是两个独立地址：Linux/容器形态默认 `127.0.0.1:3001`（WS）+ `127.0.0.1:3002`（HTTP API），两个都要填
 ## 界面一览
 - **会话**：每次处理一个会话卡片，完整留档——提示词、思考、工具调用与结果、实际发出的每条消息、用量；运行中实时刷新
 - **存档**：每个群/好友的消息库，未读标记一目了然；可手动唤醒一次处理或全部标已读
@@ -99,6 +100,7 @@ npm install
 npm run setup    # 自动下载 SnowLuma + 固定版本便携 QQ
 ```
 然后双击 `启动QQ机器人.bat`（或 `npm start`），在 SnowLuma 页签点「启动 QQ」，扫码登录即可。
+> `npm run setup` 是 **Windows 桌面版**安装器（装 Windows 版 SnowLuma + 便携 QQ）。Linux 部署不跑它：协议端用 `deploy/napcat.container`，见 [deploy/README.md](deploy/README.md)。
 **手动安装**（如果 `npm run setup` 下载失败）：
 1. **装协议端**：SnowLuma 是独立第三方项目（自带 EULA，不随本仓库分发），从其官方渠道获取后解压到项目根目录，目录名保持 `snowluma`
 2. **装便携 QQ**（可选）：
@@ -115,7 +117,7 @@ npm install          # 装依赖
 npm run setup        # 一键下载 SnowLuma + 便携 QQ（幂等，可重复执行）
 npm run setup:check  # 只检查是否已就绪
 npm start            # 桌面端启动
-npm run server       # headless 模式：浏览器打开 http://127.0.0.1:3210
+npm run server       # headless 模式：浏览器打开 http://127.0.0.1:3210（Linux 部署见 deploy/README.md）
 npm test              # 全量测试：自测 + Skill 架构 + 工具/Skill 审查 + 链接媒体转发 + 回复抢救 + 技能设置 + 表情上下文 + 技能弹窗 + 渲染 + 滚动 + 用量端到端 + 提示词
 npm run test:coverage # 覆盖测试（模块层 + 全部 HTTP 接口 + 端到端链路 + 静态界面层 + 界面接线）
 npm run test:all      # 两套一起跑

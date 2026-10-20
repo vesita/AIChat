@@ -114,12 +114,15 @@ check('00-core.js 的 api() 把 path 经 consoleUrl() 解析后才 fetch', () =>
   assert(/fetch\(\s*consoleUrl\(\s*path\s*\)/.test(body), 'api() 的 fetch 没有用解析后的 URL');
 });
 
-// ── 4. 02-sse-sessions.js：EventSource 不写死绝对路径 ─────────────────────
-check('02-sse-sessions.js 的 EventSource 不再写死 /api/events', () => {
+// ── 4. 02-sse-sessions.js：EventSource 不写死绝对路径（且保留令牌包装）──────
+check('02-sse-sessions.js 的 EventSource 不再写死 /api/events（令牌包装 + 前缀解析都在）', () => {
   const raw = /new\s+EventSource\s*\(\s*['"]\/api\/events['"]\s*\)/.exec(sse);
   assert(!raw, `仍有写死的 EventSource('/api/events')：${raw && raw[0]}`);
-  const ok = /new\s+EventSource\s*\(\s*consoleUrl\(\s*['"]\/api\/events['"]\s*\)\s*\)/.test(sse);
-  assert(ok, "EventSource 参数应形如 EventSource(consoleUrl('/api/events'))");
+  // 完整嵌套形状：URL 必须经 consoleUrl() 解析（子路径前缀），整体必须经 withConsoleToken()
+  // 包装（EventSource 不能设请求头，令牌只能走 ?token=）。只断言「包含 consoleUrl」会放过
+  // 「令牌包装被删」或「先拼令牌再解析前缀」这类退化 —— 两种都会让 SSE 401 或绕过前缀。
+  const ok = /new\s+EventSource\s*\(\s*withConsoleToken\s*\(\s*consoleUrl\s*\(\s*['"]\/api\/events['"]\s*\)\s*\)\s*\)/.test(sse);
+  assert(ok, "EventSource 参数应形如 EventSource(withConsoleToken(consoleUrl('/api/events')))，令牌包装与子路径前缀都不能丢");
 });
 
 // ── 5. 10-feedback.js：SW 按基路径注册 ────────────────────────────────────

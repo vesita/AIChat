@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 /**
- * NapCat 协议端安装脚本：下载、解压、补丁、验证，一条命令完成。
+ * NapCat 协议端安装脚本（Windows 桌面版）：下载、解压、补丁、验证，一条命令完成。
  *
  *   npm run setup:napcat          # 安装/修复（已存在则跳过，--force 强制重装）
  *   node scripts/setup-napcat.mjs --force    # 删除后重新下载
  *   node scripts/setup-napcat.mjs --check    # 只检查是否已安装
+ *
+ * 只支持 Windows：安装的是 NapCat.Shell.Windows.Node 包（依赖 Windows QQ 内核）。
+ * Linux 部署的协议端是容器（deploy/napcat.container），本脚本在非 win32 直接退出。
  *
  * 仓库不收录 NapCat / QQ 内核二进制（见 .gitignore 的 napcat/ 条目）。
  * 本脚本从 NapCat 官方 GitHub Releases 下载，用户自行触发下载，
@@ -41,6 +44,15 @@ const CHECK_ONLY = args.includes('--check');
 
 const log = (...a) => console.log('[setup-napcat]', ...a);
 const die = (msg) => { console.error('[setup-napcat] ❌', msg); process.exit(1); };
+
+// ── 平台闸（必须在任何网络请求 / 文件写入之前）──────────────────────────
+// 安装的是 NapCat.Shell.**Windows**.Node 包，依赖 Windows QQ 内核，Linux 上不可运行。
+// Linux 部署的协议端是容器（deploy/napcat.container），不经过本脚本。
+if (process.platform !== 'win32') {
+  die('本脚本只支持 Windows 桌面版（它安装的是 Windows 版 NapCat，依赖 Windows QQ 内核）。\n'
+    + '  Linux 上协议端用容器：deploy/napcat.container（OneBot WS 默认 3001、HTTP 默认 3002）。\n'
+    + '  只填 ws 不填 http 是最常见的半通故障：WS 绿、发送 404。');
+}
 
 /** 已安装判定：wrapper.node（QQ 内核）与 napcat.mjs（NapCat 本体）都在位 */
 function isInstalled() {

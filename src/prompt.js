@@ -131,6 +131,24 @@ function memoryRules() {
   ].join('\n');
 }
 
+/**
+ * 机制段：不是人格/风格，而是「这套程序怎么运转」的规则。
+ *
+ * persona.systemPromptOverride 只替换**人格/风格**（见 apply-persona.sh 与
+ * test/persona-dedup-test.mjs 的分工），机制段在默认分支与 override 分支
+ * 都必须保留 —— 否则一次人设覆盖就能让模型忘记「记忆怎么维护」这类机制。
+ * 当前清单只有记忆；表情/场景/汇报禁令是否同归，待产品拍板后加在这里。
+ */
+function mechanismSections() {
+  return [memoryRules()];
+}
+
+// 内心戏口令（只进用户提示的【记忆】段，不要求正文输出）：
+// 让模型在开口前先对着画像判断「这个人是谁、该怎么跟他说话」。放在 reasoning 里
+// 即可；正文输出会撞 [[PASS]] 协议（判定不接时只许输出标记）与回复安全网的抢救路径，
+// 所以这里明确写「留在心里」。
+const MEMORY_MONOLOGUE_HINT = '开口前先在心里判断：这句话像不像对这个人说的（他吃不吃这套、会不会踩雷、你们熟不熟）。判断留在心里，不要写进回复。';
+
 function stickerRules() {
   // 活跃度档位直接改写策略段的频率行（引导统一在系统提示，不在"本次输入"重复）
   const lvl = Math.min(3, Math.max(0, Number(getConfig().sticker?.encourage) || 0));
@@ -245,16 +263,18 @@ export function buildSystemPrompt({ persona, skillContext, extraSections = [] } 
     .map((x, i) => ({ ...x, __seq: i }))
     .sort((a, b) => (b.priority || 0) - (a.priority || 0) || a.__seq - b.__seq);
 
-  // ── 系统提示词覆盖（高级）：替换人格/风格类准则 ──
-  // 安全规则与工具协议不可覆盖（无论配置怎么写都追加在最后）——
-  // 否则一次配置误用就能把"不执行本地操作/不泄露密钥/工具协议"整套删掉。
+  // ── 系统提示词覆盖（高级）：只替换人格/风格类准则，机制段不受影响 ──
+  // 安全规则、工具协议与机制段（memoryRules 等）不可覆盖（无论配置怎么写都追加
+  // 在最后）—— 否则一次配置误用就能把"不执行本地操作/不泄露密钥/工具协议/记忆
+  // 维护"整套删掉。test/persona-dedup-test.mjs 的分工也要求「工具协议/分条/
+  // 表情/唤醒/记忆等机制只由 prompt.js 承担」，override 不该把它们一起换掉。
   const override = String(cfg.systemPromptOverride ?? '').trim();
   if (override) {
     const rendered = override
       .replaceAll('{botName}', String(cfg.botName ?? ''))
       .replaceAll('{roleText}', String(cfg.roleText ?? ''))
       .replaceAll('{participation}', participationText(cfg.participation));
-    const parts = [rendered, '', securityRules(), '', toolProtocol()];
+    const parts = [rendered, '', securityRules(), '', toolProtocol(), '', ...mechanismSections()];
     const aiRules = aiJudgeRules();
     if (aiRules) parts.push('', aiRules);
     parts.push(...renderSkillSections(skillSections));
@@ -286,7 +306,7 @@ export function buildSystemPrompt({ persona, skillContext, extraSections = [] } 
     '',
     quoteAndAt(),
     '',
-    memoryRules(),
+    ...mechanismSections(),
     '',
     stickerRules(),
     '',
@@ -745,6 +765,48 @@ function collectMemberIds(messages) {
 }
 
 /**
+ * 画像的成员优先级（决定谁进入【记忆】画像，最多 3 人）。
+ *
+ * 顺序：① 被 @（atMe 标记）/ 被引用的人 → ② 触发批最后发言者 → ③ 已读窗口
+ * 最近互动者。名字→QQ 号只在引用场景需要，用记忆里已有的 name 反查；查不到就
+ * 跳过（不猜身份）。
+ *
+ * 锚定轮直接用锚点成员集的原顺序：锚点要求同一成员集逐字节稳定，不能按本轮
+ * 触发者重排。无画像成员时返回空数组，formatForPrompt 自然返回 ''（不注空段）。
+ */
+function memoryImageUserIds({ chatKey = '', triggerEntries = [], pastMessages = [], anchored = false, anchorMemberIds = null, memory = null } = {}) {
+  if (anchored) return (anchorMemberIds || []).map((u) => String(u)).filter(Boolean);
+  const out = [];
+  const push = (uid) => {
+    const s = String(uid ?? '').trim();
+    if (s && s !== 'self' && !out.includes(s)) out.push(s);
+  };
+  let nameToUid = new Map();
+  if (memory && chatKey) {
+    try {
+      for (const m of memory.members(chatKey)) {
+        const name = String(m.name || '').trim();
+        if (name) nameToUid.set(name, String(m.userId || ''));
+      }
+    } catch { /* 记忆读失败不影响主流程 */ }
+  }
+  for (const e of triggerEntries || []) {
+    if (e?.atMe === true) push(e.senderId);
+    const replySender = String(e?.reply?.sender || '').trim();
+    if (replySender && nameToUid.has(replySender)) push(nameToUid.get(replySender));
+  }
+  for (let i = (triggerEntries || []).length - 1; i >= 0; i -= 1) {
+    const e = triggerEntries[i];
+    if (e && !e.self) push(e.senderId);
+  }
+  for (let i = (pastMessages || []).length - 1; i >= 0; i -= 1) {
+    const m = pastMessages[i];
+    if (m && !m.self) push(m.senderId);
+  }
+  return out;
+}
+
+/**
  * 组装一次运行的用户消息（不携带任何 LLM 对话历史）。
  * ctx: { chatKey, kind, chatId, chatName, triggerEntries, stickerEntries, selfNickname,
  *        contextLimit, tierInfo, activeTopic, memory, store, session, proactive,
@@ -849,25 +911,24 @@ export function buildUserPrompt(ctx) {
     '- 记得：你的普通文本输出不会发到 QQ，只有工具调用会。'
   ].join('\n'));
 
-  // 记忆：只注入与本次对话相关群友的印象（控制 token）。
+  // 记忆：只注入与本次对话相关群友的画像（控制 token；渲染上限在 memory.js）。
   // 成员口径随锚点模式变化：
-  //   锚定 → 锚点成员集（不随追加条目扩展，保证前缀字节不变；新成员在【新加入成员】段）
-  //   标准 → 本轮全部窗口成员（触发者 + 已读窗口里出现的人）
-  const relevantUserIds = new Set();
-  if (anchored) {
-    for (const uid of (anchorDecision.anchor.memberIds || [])) relevantUserIds.add(String(uid));
-  } else {
-    for (const m of ctx.triggerEntries || []) {
-      if (m.senderId && !m.self) relevantUserIds.add(String(m.senderId));
-    }
-    for (const m of (past?.messages || [])) {
-      if (m.senderId && !m.self) relevantUserIds.add(String(m.senderId));
-    }
-  }
-  const memText = ctx.memory.formatForPrompt(ctx.chatKey, { userIds: [...relevantUserIds] });
+  //   锚定 → 锚点成员集原顺序（不随追加条目扩展，保证前缀字节不变；新成员在【新加入成员】段）
+  //   标准 → 本轮相关成员按优先级：被 @/被引用 > 触发批最后发言者 > 已读窗口最近互动者
+  const memUserIds = memoryImageUserIds({
+    chatKey: ctx.chatKey,
+    triggerEntries: ctx.triggerEntries || [],
+    pastMessages: past?.messages || [],
+    anchored,
+    anchorMemberIds: anchored ? (anchorDecision.anchor.memberIds || []) : null,
+    memory: ctx.memory
+  });
+  const memText = ctx.memory.formatForPrompt(ctx.chatKey, { userIds: memUserIds });
 
-  // 记忆段（锚定模式的字节前缀从这段开始跨轮不变）
-  if (memText) parts.push(`【记忆】\n${memText}`);
+  // 记忆段（锚定模式的字节前缀从这段开始跨轮不变）。
+  // 内心戏口令跟在画像后面：画像是「这个人是谁」，口令是「开口前先按画像判断」。
+  // 段内不放时间戳（锚点会每轮 reset），口令本身也是固定文本。
+  if (memText) parts.push(`【记忆】\n${memText}\n${MEMORY_MONOLOGUE_HINT}`);
 
   // 已读信息（锚定模式 = 锚点条目；标准模式 = 全部条目）
   const readHeaderText = anchored

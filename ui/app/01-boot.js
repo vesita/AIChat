@@ -14,6 +14,9 @@ async function refreshStatus() {
       ? `OneBot 已连接${s.onebot.self ? `（${s.onebot.self.nickname}）` : ''}`
       : (s.onebot.diagnosis || 'OneBot 未连接');
     label.title = s.onebot.connected ? '' : (s.onebot.error || '');
+    // 顶栏「QQ 登录」入口：QQ/OneBot 在线时收起（没到登录现场就别打扰），
+    // 未连接时露出，用户可自助扫码把登录补回来。
+    $('#qq-login-chip')?.classList.toggle('hidden', !!s.onebot.connected);
     $('#model-label').textContent = `模型：${s.orchestrator.model || '未设置'}`;
     const u = s.usage;
     // 成本：官方价匹配得上就显示；匹配不上（中转站常见）只显示 token，不显示误导性的 ¥0
@@ -32,17 +35,44 @@ async function refreshStatus() {
   } catch (e) { /* 忽略瞬时错误 */ }
 }
 
-/** 更新顶栏就绪进度指示器（4 圆点） */
+/**
+ * 更新顶栏就绪进度指示器。
+ *
+ * 两种协议端形态语义不同（U1 误报收口）：
+ *   · embedded（内置 SnowLuma）：4 圆点 = QQ内核 / SnowLuma / OneBot / 配置
+ *   · external（外部容器 NapCat）：前两点本应用根本不管理，恒红是误报 ——
+ *     标成 na（不适用）并在 title 写明"由外部容器提供"；第 3 点改为
+ *     **OneBot 端点可达性**（connected + httpOk + dataPathState，都是 /api/status 既有字段）。
+ * 判定只认 protocol.mode；没有该字段（旧后端）时按 embedded 渲染，行为与改造前一致。
+ */
 function updateReadinessDots(s) {
   const dots = $$('#readiness-dots .rdot');
   if (dots.length !== 4) return;
 
+  const cfg = state.config || {};
+  const cfgReady = !!(cfg.api?.baseUrl && cfg.api?.model && (cfg.allow?.groups?.length || cfg.allow?.private?.length || cfg.allowAllWhenEmpty));
+  const obConnected = !!s?.onebot?.connected;
+
+  if (isExternalProtocolMode(s)) {
+    const httpOk = s?.onebot?.httpOk;
+    const dataPathState = String(s?.onebot?.dataPathState || '');
+    // 外部协议端：本应用不管理 QQ 内核 / SnowLuma —— 不再渲染成两个"没运行"的红点
+    dots[0].className = 'rdot na';
+    dots[0].title = '协议端由外部容器（NapCat）提供，本应用不管理它的进程';
+    dots[1].className = 'rdot na';
+    dots[1].title = '外部协议端模式：无需内置 QQ 内核 / SnowLuma';
+    dots[2].className = 'rdot' + (obConnected ? ' on' : '');
+    const httpNote = httpOk === false ? '；HTTP 数据面不可用（发送会失败，检查 snowluma.httpUrl）' : '';
+    const dpNote = dataPathState ? `；数据面 ${dataPathState}` : '';
+    dots[2].title = (obConnected ? `OneBot 已连接${httpNote}` : `OneBot 未连接${s?.onebot?.diagnosis ? `：${s.onebot.diagnosis}` : ''}${httpNote}`) + dpNote;
+    dots[3].className = 'rdot' + (cfgReady ? ' on' : '');
+    dots[3].title = cfgReady ? '配置已完成' : '配置未完成（点击前往设置）';
+    return;
+  }
+
   const qq = s?.qqPortable || {};
   const qqRunning = !!qq.running;
   const slRunning = !!s?.snowluma?.running;
-  const obConnected = !!s?.onebot?.connected;
-  const cfg = state.config || {};
-  const cfgReady = !!(cfg.api?.baseUrl && cfg.api?.model && (cfg.allow?.groups?.length || cfg.allow?.private?.length || cfg.allowAllWhenEmpty));
 
   // 圆点 0：QQ 内核
   dots[0].className = 'rdot' + (qqRunning ? ' on' : '');

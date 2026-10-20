@@ -1,8 +1,8 @@
 // QQ Agent 控制台前端入口（M9 拆分后的 ESM 桥）。
 // 本文件只做一件事：把 /vendor/*.js 的 ES module 导出挂到 window 上，
-// 供后续 12 个普通脚本（ui/app/00-11）按全局名直接引用。
+// 供后续 13 个普通脚本（ui/app/00-13）按全局名直接引用。
 //
-// 为什么不直接把 12 段也做成 ES module：跨段共享的顶层 let/const（state、
+// 为什么不直接把 13 段也做成 ES module：跨段共享的顶层 let/const（state、
 // usageRange、activeVSlider、updateAvailable…）有 40+ 个绑定，做成 ESM 要给
 // 每一段写 import/export 清单，拆分本身就会引入大量可写错的地方；
 // 普通脚本 + defer 顺序执行的全局词法绑定与原单文件语义完全一致，

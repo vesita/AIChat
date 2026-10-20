@@ -1819,3 +1819,44 @@ details.collapsible.coll-shut > summary::after { transform: rotate(0deg); }
     scroll-behavior: auto !important;
   }
 }
+
+/* ══ 扫码登录面板 / 令牌输入框（13-qq-login.js）══
+   与 .model-modal 同级视觉：bg3 底 + 1px bd2 + r-lg；遮罩用 --overlay。
+   二维码是页面唯一"必须白底"的元素（二维码识别要求高对比），单独给白卡 + 内边距。 */
+.qq-login-overlay {
+  position: fixed; inset: 0; z-index: 400;
+  background: var(--overlay);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.qq-login-card {
+  position: relative;
+  width: min(420px, 94vw); max-height: 88vh; overflow-y: auto;
+  background: var(--bg3); border: 1px solid var(--bd2); border-radius: var(--r-lg);
+  box-shadow: var(--raise-3);
+  padding: 22px 24px 20px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.qq-login-card h2 { margin: 0; font-size: 17px; font-weight: 650; color: var(--tx); }
+.qq-login-hint { margin: 0; font-size: 12.5px; line-height: 1.6; color: var(--tx2); }
+.qq-login-close {
+  position: absolute; top: 12px; right: 12px;
+  width: 26px; height: 26px; border-radius: var(--r-full);
+  background: var(--bg2); border: 1px solid var(--bd); color: var(--tx3);
+  font-size: 15px; line-height: 1; cursor: pointer;
+}
+.qq-login-close:hover { color: var(--tx); border-color: var(--bd2); }
+/* 二维码：白底 + 8px 静区，任何主题下都保持可扫描 */
+.qq-login-qr {
+  align-self: center;
+  background: #fff; border-radius: var(--r-md);
+  padding: 10px; line-height: 0;
+  box-shadow: var(--raise-1);
+}
+.qq-login-qr img { display: block; width: 240px; height: 240px; }
+.qq-login-phase { font-size: 14px; font-weight: 600; color: var(--tx); text-align: center; }
+.qq-login-error { font-size: 12.5px; line-height: 1.5; color: var(--err); overflow-wrap: anywhere; }
+.qq-login-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.qq-login-actions .btn { flex: 0 0 auto; }
+/* 外部协议端模式：本应用不管理的圆点是"不适用"，不是"坏了" */
+.rdot.na { background: transparent; border: 1px dashed var(--bd2); box-shadow: none; }

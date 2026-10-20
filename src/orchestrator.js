@@ -31,6 +31,28 @@ const WAKE_JUDGE_TIMEOUT_MS = 300;
 /** 超时哨兵：与插件合法返回（对象）区分开。 */
 const WAKE_JUDGE_TIMEOUT = Symbol('wake-judge-timeout');
 
+// ── 可靠性修复（M-1 / M-2 / T-1）与负向对照开关 ──────────────────────────
+// 负向对照开关只给测试用：COREFIX_M1=0 / COREFIX_M2=0 关掉对应修复，
+// 用来证明回归测试"修前会失败"。生产环境不设这些变量 → 修复恒开。
+const FIX_BATCH_RECOVERY = process.env.COREFIX_M1 !== '0';
+const FIX_DIRECTED_ZERO_SEND_ALERT = process.env.COREFIX_M2 !== '0';
+/** 定向触发原因（与 prompt.js / #judgeEligible 同一份口径）。 */
+const DIRECTED_REASONS = new Set(['被艾特', '拍了拍我', '私聊消息']);
+/** 可靠性计数的滚动窗口：24 小时（/api/status 里展示的是"近 24h 发生次数"）。 */
+const RELIABILITY_WINDOW_MS = 24 * 3600 * 1000;
+
+/** 工具执行超时（T-1）：同一个挂住的工具不值得用会话级重试连打几次超时预算。 */
+class ToolTimeoutError extends Error {
+  constructor(toolName, timeoutMs, sessionId) {
+    super(`工具执行超时：${toolName} 在 ${timeoutMs}ms 内未返回`);
+    this.name = 'ToolTimeoutError';
+    this.code = 'TOOL_TIMEOUT';
+    this.toolName = toolName;
+    this.timeoutMs = timeoutMs;
+    this.sessionId = sessionId;
+  }
+}
+
 export class Orchestrator {
   constructor({ store, memory, stickers, sender, sessions, onebot, emit = null, reminders = null, videoReader = null }) {
     this.store = store;
@@ -85,6 +107,16 @@ export class Orchestrator {
     this.aborted = false;
     this.reminderTimer = null;         // 提醒调度定时器
     this.reminderFiring = new Set();   // 防止同一提醒并发触发
+    // ── 可靠性计数（24h 滚动，statusSummary/GET /api/status 可观测）──
+    // M-2：定向触发、正常收尾但一条都没发（静默漏回）
+    this.missedDirectedTimes = [];
+    // M-1：定向触发、运行失败且一条都没发（已回滚未读，进入自动重试/等人处理）
+    this.unansweredDirectedTimes = [];
+    // T-1：工具执行超时次数
+    this.toolTimeoutTimes = [];
+    // chatKey -> { count }：触发批失败且未发出任何消息后的自动重试计数。
+    // 有次数上限（默认 2），用尽后不再回滚未读（否则会变成无限重试循环）。
+    this.failedBatchRetries = new Map();
   }
 
   /**
@@ -158,6 +190,115 @@ export class Orchestrator {
     this.emit('session-update', id);
     this.scheduleWake(s.chatKey, 0, { reuseSessionId: id });
     return { ok: true, restored };
+  }
+
+  // ── 可靠性：失败批回补 / 定向零发送观测 / 工具超时计数 ───────────────────
+
+  /**
+   * 记一次可靠性事件（24h 滚动计数 + 固定格式日志 + SSE 事件）。
+   *
+   * 为什么集中在这里：M-1/M-2/T-1 都要"不能静默"——事件必须同时出现在日志、
+   * /api/status 与 UI 事件流里，否则排障时只能翻远端日志。
+   */
+  #recordReliability(kind, message, payload = {}) {
+    const now = Date.now();
+    const list = kind === 'missedDirected' ? this.missedDirectedTimes
+      : kind === 'unansweredDirected' ? this.unansweredDirectedTimes
+        : this.toolTimeoutTimes;
+    list.push(now);
+    while (list.length && now - list[0] > RELIABILITY_WINDOW_MS) list.shift();
+    // 工具超时是错误级；其余是告警级（正常运行也可能出现，重点在可观测）。
+    if (kind === 'toolTimeout') console.error(message);
+    else console.warn(message);
+    this.emit('reliability-alert', { kind, at: now, message, ...payload });
+  }
+
+  /** 读取 24h 滚动计数（顺带清理过期时间戳）。 */
+  #rollingCount(list) {
+    const now = Date.now();
+    while (list.length && now - list[0] > RELIABILITY_WINDOW_MS) list.shift();
+    return list.length;
+  }
+
+  /**
+   * 这条触发批是否"定向"（私聊 / 被艾特 / 拍一拍）。
+   *
+   * 口径来自 prompt.js 的"必回"定义：定向触发是硬语义，零发送必须告警；
+   * 群里的随机/关键词接话属于"可以不接"，不能误报。
+   */
+  #isDirectedBatch(chatKey, triggerEntries = [], contextReason = '') {
+    if (String(chatKey).startsWith('private:')) return true;
+    if (DIRECTED_REASONS.has(String(contextReason || ''))) return true;
+    return (Array.isArray(triggerEntries) ? triggerEntries : [])
+      .some((m) => m?.atMe === true || m?.isPoke === true);
+  }
+
+  /**
+   * M-2：定向触发、正常收尾但一条消息都没发 → 告警 + 24h 计数。
+   *
+   * 线上实测 183 条会话里有 4 条这种"必回却没回"；旧实现只看 sent.length，
+   * 于是 status=noreply 被当成正常，日志与状态面都没有任何痕迹。
+   */
+  #alertDirectedZeroSend({ chatKey, session, triggerEntries, contextReason, status }) {
+    if (!FIX_DIRECTED_ZERO_SEND_ALERT) return;
+    if (status !== 'noreply') return;                        // error 走 M-1，aborted 是用户选择
+    if ((session.sent || []).length > 0) return;
+    if (!this.#isDirectedBatch(chatKey, triggerEntries, contextReason)) return;
+    session.missedDirected = true;
+    this.#recordReliability('missedDirected',
+      `[reliability] 定向零发送：${chatKey} 会话 ${session.id}（触发：${contextReason || '定向'}）一条消息都没发出（status=noreply）`,
+      { chatKey, sessionId: session.id });
+  }
+
+  /**
+   * M-1：触发批运行失败且一条消息都没发出 → 回滚未读 + 退避自动重试。
+   *
+   * 根因：触发批在运行前就被 drainUnread 置了已读，失败收尾只把会话标成 error。
+   * 于是这批消息永久处于"已读、无回复"状态（线上实测：503 风暴后 @ 消息没人回）。
+   *
+   * 做法：按触发批的时间窗把未读翻回来（store.markUnreadInWindow 是现成能力），
+   * 再排一次带退避的唤醒 —— 下一次 wake 会重新 drain 同一批消息并重跑。
+   * 每个 chatKey 最多自动重试 cfg.reliability.batchRetries 次（默认 2），用尽后
+   * 不再回滚（避免无限重试循环），只留用户可用的手动重试与状态面计数。
+   *
+   * 已发出过消息的失败**不**回滚：重复发言比漏回更糟（与 retrySession 的守卫同口径）。
+   */
+  #recoverFailedBatch({ chatKey, session, triggerEntries, error }) {
+    if (!FIX_BATCH_RECOVERY) return;
+    if (this.aborted || this.paused) return;
+    if ((session.sent || []).length > 0) return;
+    const batch = Array.isArray(triggerEntries) ? triggerEntries : [];
+    if (!batch.length) return;
+    const directed = this.#isDirectedBatch(chatKey, batch, session.contextReason);
+    // 观测：定向且失败未发 = 用户视角的"被艾特了没人理"，单独计数（先于重试次数判断）。
+    if (directed) {
+      this.#recordReliability('unansweredDirected',
+        `[reliability] 定向触发运行失败且未发出任何消息：${chatKey} 会话 ${session.id}（${error?.message ?? error}）`,
+        { chatKey, sessionId: session.id });
+    }
+    const cfg = getConfig().reliability || {};
+    const maxRetries = Math.max(0, Number.isFinite(Number(cfg.batchRetries)) ? Number(cfg.batchRetries) : 2);
+    const state = this.failedBatchRetries.get(chatKey) || { count: 0 };
+    state.count += 1;
+    this.failedBatchRetries.set(chatKey, state);
+    if (state.count > maxRetries) {
+      console.error(`[reliability] ${chatKey} 触发批失败后自动重试已用尽（${maxRetries} 次）：不再回滚未读，会话 ${session.id} 可在会话页手动重试`);
+      return;
+    }
+    const tsList = batch.map((m) => Number(m?.ts) || 0).filter((n) => n > 0);
+    const startedAt = tsList.length ? Math.min(...tsList) : (Number(session.startedAt) || Date.now());
+    const endedAt = tsList.length ? Math.max(...tsList) : (Number(session.endedAt) || Date.now());
+    const restored = this.store.markUnreadInWindow(chatKey, startedAt, endedAt);
+    if (!restored) {
+      console.error(`[reliability] ${chatKey} 触发批回滚没有恢复任何未读（时间窗 ${startedAt}~${endedAt}），无法自动重试`);
+      return;
+    }
+    const base = Math.max(0, Number(cfg.batchRetryBaseMs) || 5000);
+    const delay = base * Math.pow(2, state.count - 1);
+    console.warn(`[reliability] ${chatKey} 触发批失败且一条未发（${error?.message ?? error}）：已回滚 ${restored} 条未读，${delay}ms 后自动重试（第 ${state.count}/${maxRetries} 次）`);
+    this.emit('chat-update', chatKey);
+    // 与 drain 的 scheduleWake 同一个 set 去重：这里先排，wake 末尾的 drain 不会叠加。
+    this.scheduleWake(chatKey, delay);
   }
 
   // ── 入站接口 ───────────────────────────────────────────────────────────
@@ -857,6 +998,10 @@ export class Orchestrator {
           const sentCount = (session.sent || []).length;
           const canRetry = attempt < MAX_SESSION_ATTEMPTS
             && isRetryableError(error)
+            // T-1：工具超时不是瞬时抖动。会话级重试会立刻用干净上下文再跑一遍，
+            // 大概率又撞上同一个挂住的工具、再等满一个超时预算 —— 交给 wake 末尾的
+            // 批级退避重试（默认 5s 起）更合理。
+            && error?.code !== 'TOOL_TIMEOUT'
             && sentCount === 0
             && !this.aborted;
           if (!canRetry) break;
@@ -888,6 +1033,8 @@ export class Orchestrator {
           this.sessions.finish(session.id, 'error');
           this.emit('session-end', { sessionId: session.id, chatKey, status: 'error', error: session.error });
           console.error(`[orchestrator] 运行 ${session.id} 出错:`, lastError);
+          // M-1：失败且一条未发 → 回滚触发批未读，排一次退避自动重试
+          this.#recoverFailedBatch({ chatKey, session, triggerEntries, error: lastError });
         }
       }
     } finally {
@@ -895,6 +1042,9 @@ export class Orchestrator {
       this.runningChats.delete(chatKey);
       this.emit('chat-update', chatKey);
     }
+
+    // 成功的运行清空失败重试计数：下一批触发重新获得完整的重试预算。
+    if (!lastError) this.failedBatchRetries.delete(chatKey);
 
     // drain：运行期间来的新消息 → 再次新开会话处理（这是"确保看到所有发言"的关键）
     if (!this.aborted && !this.paused) {
@@ -1179,6 +1329,9 @@ export class Orchestrator {
       session,
       reminders: this.reminders,
       videoReader: this.videoReader,
+      // T-1：中止信号交给工具层。工具执行期间点「中止」时 executeTool 立即收敛
+      // （不再等工具返回），供本就不支持中途退出的工具提前结束。
+      abortSignal,
       emit: (type, payload) => this.emit(type, payload)
     };
 
@@ -1423,6 +1576,33 @@ export class Orchestrator {
         const result = blocked
           ? { content: `错误：${blocked.reason || '该工具调用被 Skill 拒绝'}`, isError: true }
           : await executeTool(toolDefs, ctx, name, argsRaw);
+        // ── T-1：工具执行期间中止 ──
+        // executeTool 用 abortSignal 与工具竞速，中止时立刻返回 aborted 结果。
+        // 这里走标准中止收尾（与轮次边界的检查同一条路径），UI 立刻退出「运行中」。
+        if (result?.aborted) {
+          this.sessionAbortMarks.delete(session.id);
+          this.sessionAbortControllers.delete(session.id);
+          this.sessions.finish(session.id, 'aborted');
+          this.emit('session-end', {
+            sessionId: session.id,
+            chatKey,
+            status: 'aborted',
+            sent: session.sent.length,
+            usage: session.usage
+          });
+          console.log(`[orchestrator] 会话 ${session.id} 在工具执行期间被用户中止（工具 ${name}）`);
+          return;
+        }
+        // ── T-1：工具执行超时 ──
+        // 以失败收敛：记计数 + 抛出非会话级可重试的错误，由 wake 统一收尾
+        // （释放并发槽 → 若一条未发则走 M-1 的批级回退重试）。
+        if (result?.timedOut) {
+          this.sessionAbortControllers.delete(session.id);
+          this.#recordReliability('toolTimeout',
+            `[reliability] 工具执行超时：${name}（会话 ${session.id}，${result.timeoutMs}ms 未返回）`,
+            { chatKey, sessionId: session.id, toolName: name, timeoutMs: result.timeoutMs });
+          throw new ToolTimeoutError(name, result.timeoutMs, session.id);
+        }
         try {
           await skillManager.runHook('after-tool', {
             ...skillContext, toolName: name, argsRaw, result, session
@@ -1533,6 +1713,14 @@ export class Orchestrator {
 
     // 收尾：发过话 = done；没发 = noreply（这是正常选项）
     const status = session.error ? 'error' : (session.sent.length > 0 ? 'done' : 'noreply');
+    // ── M-2：定向触发「零发送」的后置断言（只观测：warn + 24h 计数，不改行为）──
+    this.#alertDirectedZeroSend({
+      chatKey,
+      session,
+      triggerEntries,
+      contextReason: tierInfo?.reason,
+      status
+    });
     this.sessionAbortControllers.delete(session.id);
     this.sessions.finish(session.id, status);
     this.emit('session-end', {
@@ -2193,7 +2381,14 @@ export class Orchestrator {
       consolidating: [...this.consolidating],
       onebotConnected: this.onebot.connected,
       model: cfg.api.model,
-      maxConcurrentRuns: cfg.maxConcurrentRuns
+      maxConcurrentRuns: cfg.maxConcurrentRuns,
+      // ── 可靠性计数（近 24h）：把"漏回/静默/超时卡死"变成可观测数字 ──
+      // M-2：定向触发且正常收尾但一条没发（静默漏回）
+      missedDirected: this.#rollingCount(this.missedDirectedTimes),
+      // M-1：定向触发且运行失败未发（已回滚未读并进入自动重试）
+      unansweredDirected: this.#rollingCount(this.unansweredDirectedTimes),
+      // T-1：工具执行超时（会话已按失败收敛并释放并发槽）
+      toolTimeouts: this.#rollingCount(this.toolTimeoutTimes)
     };
   }
 }

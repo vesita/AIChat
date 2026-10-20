@@ -487,8 +487,6 @@ const state = {
 };
 
 // ── 工具函数 ──
-// 控制台标识头：证明请求来自本控制台页面，而非外部网页冒用浏览器。
-// 带自定义头的请求必须过 CORS 预检，天然挡住跨站脚本/表单的静默读取。
 /** 数字加千分位（token 计数用）。 */
 const fmtTok = (n) => (Number(n) || 0).toLocaleString('zh-CN');
 
@@ -554,8 +552,6 @@ const USAGE_RANGES = [
   ['all', '全部']
 ];
 
-const CONSOLE_MARKER = 'qq-agent-console';
-
 /* ══════════════════════════════════════════════════════════════
    主题（明/暗）—— 「跟随系统」「？」已移除
    ══════════════════════════════════════════════════════════════ */
@@ -611,20 +607,78 @@ function consoleUrl(path) {
   return path.startsWith('/') ? CONSOLE_BASE + path.slice(1) : path;
 }
 
+// ── 控制台访问令牌（鉴权闭环，§10.2）─────────────────────────────────────
+// 令牌只从 `?token=` 进：读完立刻从地址栏抹掉，存 sessionStorage（随标签页销毁），
+// 之后所有 /api 请求走 x-console-token 头；EventSource / QR <img> 带不了头，走 ?token=。
+// 刻意不进 localStorage：这是管理员凭据，不该在磁盘上长期驻留。
+// 后端未配 server.token 时 authorize() 不校验任何令牌 —— 前端也不发假值冒充。
+const CONSOLE_TOKEN_KEY = 'qqa-console-token';
+
+function getConsoleToken() {
+  try { return sessionStorage.getItem(CONSOLE_TOKEN_KEY) || ''; } catch { return ''; }
+}
+
+function setConsoleToken(t) {
+  try {
+    if (t) sessionStorage.setItem(CONSOLE_TOKEN_KEY, t);
+    else sessionStorage.removeItem(CONSOLE_TOKEN_KEY);
+  } catch { /* 隐私模式忽略 */ }
+}
+
+/** 把令牌追加到同源 URL（EventSource / <img> 不能带头，只能走 ?token=）。 */
+function withConsoleToken(url) {
+  const t = getConsoleToken();
+  if (!t) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(t);
+}
+
+/** 页面加载时把 ?token= 收进 sessionStorage，并把令牌从地址栏抹掉（不留在历史/书签里）。 */
+function captureConsoleToken() {
+  let u;
+  try { u = new URL(location.href); } catch { return; }
+  const t = u.searchParams.get('token') || '';
+  if (!t) return;
+  setConsoleToken(t);
+  u.searchParams.delete('token');
+  try { history.replaceState(null, '', u.pathname + (u.search ? u.search : '') + u.hash); } catch { /* 忽略 */ }
+}
+
+// 顶层立即执行：必须早于首次 api()（首屏 status 请求就带令牌）。
+captureConsoleToken();
+
+/**
+ * 协议端形态判定：external = 由外部容器（NapCat）提供，本应用不管理它。
+ * 字段来自 /api/status 的 protocol.mode；没有该字段（后端未升级）时按内置模式处理，
+ * 保证「前端先上、后端后上」时行为与今天完全一致。
+ */
+function isExternalProtocolMode(status) {
+  return String(status?.protocol?.mode || '') === 'external';
+}
+
 async function api(path, options = {}) {
   // keepalive 由调用方按需传（配置保存的 POST 用它：页面卸载后请求仍能完成）
-  const { keepalive, ...rest } = options;
+  const { keepalive, headers: extraHeaders, ...rest } = options;
+  const token = getConsoleToken();
   const res = await fetch(consoleUrl(path), {
     headers: {
       'content-type': 'application/json',
-      'x-console-token': CONSOLE_MARKER,
-      ...(rest.headers || {})
+      // 有令牌才发；没有就不发这个头（之前的硬编码假值会让配了 token 的后端全部 401）。
+      ...(token ? { 'x-console-token': token } : {}),
+      ...(extraHeaders || {})
     },
     ...rest,
     ...(keepalive ? { keepalive: true } : {})
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(data.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    // 401 单独成码：首屏据此切「令牌输入框」而不是「启动超时 ×90 秒」（§10.3）。
+    if (res.status === 401) err.code = 'UNAUTHORIZED';
+    else if (data.code) err.code = data.code;
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -672,31 +726,55 @@ function hideLoading() {
 async function pollUntilReady(startedAt) {
   try {
     const status = await api('/api/status');
-    if (!status.onebot?.connected) setLoadingStatus(status.onebot?.diagnosis || 'SnowLuma 已就绪，正在连接 OneBot…');
+    state.status = status;
+    if (!status.onebot?.connected) setLoadingStatus(status.onebot?.diagnosis || '服务已就绪，正在等待 OneBot 连接…');
     else setLoadingStatus(`OneBot 已连接${status.onebot.self ? `（${status.onebot.self.nickname}）` : ''}，即将进入控制台…`);
-    // 服务已可达，无需等到 OneBot 完全连上即可进入控制台（体检卡会继续提示）
-    return true;
+    return 'ready';
   } catch (e) {
+    // 401 = 后端开了令牌而本页没带对：立即停轮询去要令牌（§10.3）。
+    // 以前把一切异常都当"还没就绪"重试 90 秒，用户只能看到误导性的「启动超时」。
+    if (e?.code === 'UNAUTHORIZED') return 'need_token';
     // startedAt 由 bootLoop 传入：曾经在这里声明，每轮重置，
     // 45 秒超时判定永远为 false，"启动超时"提示从未出现过
     if (Date.now() - startedAt > 45000) {
-      setLoadingStatus('启动超时。请确认项目内 snowluma 文件夹完整，或到设置页手动启动 SnowLuma。');
+      setLoadingStatus('启动超时。请确认服务已启动、端口可达，或到设置页检查配置。');
       return false;
     }
     return false;
   }
 }
 
+/**
+ * 首屏分流（§10.3 + §13）：
+ *   · OneBot 已连接 ⇒ 直接进控制台（不打扰正在工作的机器人）
+ *   · QQ 未登录 ⇒ 打开扫码面板。登录态的唯一权威判据是 /api/qq-login/status 的
+ *     phase（不从 onebot.connected 反推：QQ 已登录但离线时它也是 false）
+ *   · /api/qq-login/* 不存在（后端未升级）或临时错误 ⇒ 退回改造前的行为：
+ *     进控制台 + 现有诊断提示（保证前端先于后端上线时不把用户挡在门外）
+ */
+async function detectBootRoute(status) {
+  if (status?.onebot?.connected) return 'ready';
+  try {
+    const st = await api('/api/qq-login/status');
+    const phase = String(st?.phase || '');
+    if (!phase) return 'ready';
+    return phase === 'logged_in' ? 'ready' : 'logged_out';
+  } catch (e) {
+    if (e?.code === 'UNAUTHORIZED') return 'need_token';
+    return 'ready';
+  }
+}
+
 async function bootLoop() {
   const startedAt = Date.now();
   for (let i = 0; i < 90; i++) {
-    if (await pollUntilReady(startedAt)) break;
-    await new Promise((r) => setTimeout(r, 1000));
+    const r = await pollUntilReady(startedAt);
+    if (r === 'need_token') return r;
+    // 服务已可用 ⇒ 再看 QQ 登录态决定进控制台还是先出扫码面板
+    if (r === 'ready') return detectBootRoute(state.status);
+    await new Promise((res) => setTimeout(res, 1000));
   }
-  hideLoading();
-  refreshStatus();
-  if (state.tab === 'sessions') loadSessions();
-  if (state.tab === 'memory') loadMemoryView();
+  return 'ready';
 }
 
 // ── 就绪度体检（傻瓜式引导的核心） ──
@@ -719,8 +797,14 @@ function assessReadiness(cfg, status) {
   });
   const allowOk = (cfg.allow?.groups?.length || cfg.allow?.private?.length || cfg.allowAllWhenEmpty);
   checks.push({ ok: !!allowOk, label: allowOk ? `白名单：${(cfg.allow.groups || []).length} 个群 / ${(cfg.allow.private || []).length} 个好友` : '还没有配置白名单（必填）', fix: allowOk ? null : 'settings-allow' });
-  const obOk = status?.onebot?.connected;
-    checks.push({ ok: !!obOk, label: obOk ? `OneBot 已连接${status.onebot.self ? `（${status.onebot.self.nickname}）` : ''}` : (status.onebot.diagnosis || 'OneBot（SnowLuma）未连接 —— 请到 SnowLuma 页签启动'), fix: obOk ? null : 'snowluma-tab' });
+  const external = isExternalProtocolMode(status);
+  const obOk = !!status?.onebot?.connected;
+  const obLabel = obOk
+    ? `OneBot 已连接${status.onebot.self ? `（${status.onebot.self.nickname}）` : ''}`
+    : external
+      ? (status?.onebot?.diagnosis || 'OneBot 未连接：协议端由外部容器（NapCat）提供，请确认容器已运行且 QQ 已登录')
+      : (status?.onebot?.diagnosis || 'OneBot（SnowLuma）未连接 —— 请到 SnowLuma 页签启动');
+  checks.push({ ok: obOk, label: obLabel, fix: obOk ? null : 'snowluma-tab' });
   return { ready: urlOk && modelOk && allowOk && obOk, checks };
 }
 
@@ -735,7 +819,10 @@ function renderBanner() {
     html = '⏸ 机器人已暂停，不会处理任何消息。';
   } else if (s && !s.onebot.connected && !s.onebot.everConnected) {
     show = true;
-    html = '🔌 OneBot（SnowLuma）还没连上：请确认 SnowLuma 已启动，且设置里的 WS/HTTP 地址正确。';
+    // 外部协议端模式下，把用户指向本地不存在的「SnowLuma 页签」是误导（U 组误报）。
+    html = isExternalProtocolMode(s)
+      ? '🔌 OneBot 还没连上：协议端由外部容器（NapCat）提供 —— 请确认容器已运行且 QQ 已登录；登录不上去顶栏「QQ 登录」扫码。'
+      : '🔌 OneBot（SnowLuma）还没连上：请确认 SnowLuma 已启动，且设置里的 WS/HTTP 地址正确。';
   }
   if (show) {
     // 出现交给 .banner 自带的 pageIn；uiShow 只负责作废进行中的淡出并落实状态

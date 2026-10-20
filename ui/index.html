@@ -46,7 +46,8 @@
         <span id="search-count-label" class="muted" title="今日联网搜索次数（web_search / web_fetch）">搜索：-</span>
       </div>
       <span class="sep"></span>
-      <!-- 就绪进度指示器：4 圆点 = QQ运行 / SnowLuma运行 / OneBot连接 / 配置完成 -->
+      <!-- 就绪进度指示器：内置协议端模式 4 圆点 = QQ运行 / SnowLuma运行 / OneBot连接 / 配置完成；
+           外部协议端模式（/api/status.protocol.mode=external）前两点标 na（本应用不管理），第三点显示 OneBot 端点可达性 -->
       <span id="readiness-dots" class="readiness-dots" title="就绪进度：点击跳转到对应设置">
         <span class="rdot" data-target="snowluma" title="QQ 内核未运行"></span>
         <span class="rdot" data-target="snowluma" title="SnowLuma 未运行"></span>
@@ -55,6 +56,8 @@
       </span>
       <button id="theme-btn" class="icon-btn" title="切换主题（暗 ↔ 亮）" aria-label="切换主题"></button>
       <button id="pause-btn" class="btn btn-small">暂停</button>
+      <!-- QQ 未登录时的自助扫码入口：refreshStatus() 只在 onebot.connected 时隐藏它 -->
+      <button id="qq-login-chip" class="nav-btn hidden" title="QQ 未登录：点此扫码登录">QQ 登录</button>
     </div>
   </header>
 
@@ -63,7 +66,7 @@
   <div id="loading-overlay" class="loading-overlay">
     <div class="loading-card">
       <div class="loading-title">QQ Agent 正在启动</div>
-      <div class="loading-sub" id="loading-status">正在启动 SnowLuma 与 OneBot 服务，请稍候…</div>
+      <div class="loading-sub" id="loading-status">正在启动服务并检查协议端，请稍候…</div>
       <div class="loading-spinner"></div>
       <pre class="loading-logs" id="loading-logs"></pre>
     </div>
@@ -156,7 +159,7 @@
     </section>
   </main>
 
-  <!-- M9 拆分：ESM 桥（vendor 模块 → window）先执行；其后 12 段普通脚本按 defer 顺序执行，
+  <!-- M9 拆分：ESM 桥（vendor 模块 → window）先执行；其后 13 段普通脚本按 defer 顺序执行，
        module 与 defer 共享同一条按文档顺序的延迟队列，保证桥先于 00-core.js。 -->
   <script type="module" src="./app.js"></script>
   <script defer src="./app/00-core.js"></script>
@@ -171,6 +174,8 @@
   <script defer src="./app/09-community.js"></script>
   <script defer src="./app/10-feedback.js"></script>
   <script defer src="./app/12-concept2-ui.js"></script>
+  <!-- 扫码登录面板：必须在 11-init（启动入口会调用 openQQLoginPanel/openTokenPrompt）之前 -->
+  <script defer src="./app/13-qq-login.js"></script>
   <script defer src="./app/11-init.js"></script>
 
   <!-- 阿里云验证码 2.0（意见收集/金句上传共用）：容器常驻；AliyunCaptchaConfig 与

@@ -65,6 +65,12 @@ async function loadSnowlumaPage({ quiet = false } = {}) {
     const s = status;
     const box = $('#snowluma-page');
     if (!box) return;
+    // U2 误报收口：外部容器模式下本页不展示内置 SnowLuma 的叙事（谁都没有启动它，
+    // 也不该出现 npm run setup / 未找到目录 / 未运行 这些把人引向错误方向的假警报）。
+    if (isExternalProtocolMode(s)) {
+      renderExternalProtocolPage(box, s, appLogsData);
+      return;
+    }
     const running = !!(s.snowluma?.running);
     const onebotConnected = !!s.onebot?.connected;
     const dir = s.snowluma?.dir || '';
@@ -357,5 +363,95 @@ async function loadSnowlumaPage({ quiet = false } = {}) {
     });
   } catch (e) {
     if (!quiet) console.error(e);
+  }
+}
+
+/**
+ * 外部协议端模式下的「SnowLuma」页签（U2 误报收口）。
+ *
+ * 现场是「宿主系统单元 AIChat + 用户级容器 NapCat」，本应用根本不管理协议端进程：
+ * 显示"SnowLuma 未运行 / 未找到目录 / 请先 npm run setup"全是误报，还会把人引去
+ * 装一套 Windows 协议端。所以这里整页改成三块只读事实：
+ *   协议端形态（外部容器）+ OneBot 端点可达性 + HTTP/数据面探测结果 + 排障命令。
+ * 协议端健康的**唯一**来源仍是 /api/status（protocol / onebot.httpOk / dataPathState），
+ * 不在前端本地重新判定。
+ */
+function renderExternalProtocolPage(box, s, appLogsData) {
+  const ob = s.onebot || {};
+  const protocol = s.protocol || {};
+  const httpOk = ob.httpOk;
+  const dataPathState = String(ob.dataPathState || '');
+  const endpoint = String(protocol.endpoint || '');
+  const self = ob.self ? `${ob.self.nickname || ''}${ob.self.userId ? `（${ob.self.userId}）` : ''}` : '';
+  const reach = ob.connected
+    ? `已连接${self ? `：${self}` : ''}`
+    : `未连接${ob.diagnosis ? `：${String(ob.diagnosis).slice(0, 160)}` : ''}`;
+  const httpText = httpOk === true
+    ? '正常'
+    : (httpOk === false
+      ? `不可用${ob.httpError ? `：${String(ob.httpError).slice(0, 120)}` : ''}`
+      : '尚未探测');
+  const appLogs = appLogsData?.logs || [];
+  const appLogLevel = appLogsData?.level || 'info';
+  const appLogText = appLogs.map((e) => {
+    const t = new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false });
+    const lv = String(e.level || 'info').toUpperCase().padEnd(5);
+    return `[${t}] [${lv}] [${e.module || '-'}] ${e.text}`;
+  }).join('\n') || '暂无日志';
+
+  box.innerHTML = `
+    <div class="snowluma-page-card">
+      <h2>协议端（外部容器）</h2>
+      <div class="snowluma-state-row">
+        <span class="dot dot-on"></span>
+        <span>协议端：<strong>外部容器（NapCat）</strong></span>
+        <span class="muted">进程由容器管理，本应用不启动/不关闭它</span>
+      </div>
+      <div class="snowluma-state-row">
+        <span class="dot ${ob.connected ? 'dot-on' : 'dot-off'}"></span>
+        <span>OneBot 端点：<strong>${esc(reach)}</strong></span>
+        ${endpoint ? `<span class="muted">${esc(endpoint)}</span>` : ''}
+      </div>
+      <div class="snowluma-state-row">
+        <span>HTTP 数据面：<strong>${esc(httpText)}</strong></span>
+        ${dataPathState ? `<span class="muted">数据面自检：${esc(dataPathState)}</span>` : ''}
+      </div>
+      <div class="snowluma-state-row muted" style="font-size:12px">
+        排障：<code>systemctl --user status napcat</code> · <code>podman ps | grep napcat</code> · 需要扫码时点顶栏「QQ 登录」
+      </div>
+      <div class="snowluma-actions">
+        <button class="btn btn-small" id="sl-refresh-btn">刷新状态</button>
+        <span id="sl-hint" class="muted" style="font-size:12px"></span>
+      </div>
+      <div class="sl-log-block sl-app-logs">
+        <div class="hint sl-log-head">
+          <span>应用日志（最近 ${appLogs.length} 条，同时落盘到 data/logs/）</span>
+          <label class="sl-log-level">
+            <span class="muted">落盘级别</span>
+            <select id="app-log-level" title="低于该级别的日志不写入磁盘">
+              ${['debug', 'info', 'warn', 'error'].map((v) =>
+                `<option value="${v}" ${appLogLevel === v ? 'selected' : ''}>${v}</option>`).join('')}
+            </select>
+          </label>
+          <button class="btn btn-small" id="app-logs-refresh-btn" title="重新拉取最近日志">刷新</button>
+        </div>
+        <pre class="snowluma-logs-view" id="app-logs-view">${esc(appLogText)}</pre>
+      </div>
+    </div>`;
+
+  $('#sl-refresh-btn')?.addEventListener('click', () => loadSnowlumaPage());
+  $('#app-logs-refresh-btn')?.addEventListener('click', () => loadSnowlumaPage({ quiet: true }));
+  const levelSel = $('#app-log-level');
+  if (levelSel) {
+    levelSel.addEventListener('change', async () => {
+      try {
+        const r = await api('/api/logs/level', { method: 'POST', body: JSON.stringify({ level: levelSel.value }) });
+        if (r && r.level) levelSel.value = r.level;
+        loadSnowlumaPage({ quiet: true });
+      } catch (e) {
+        const hint = $('#sl-hint');
+        if (hint) hint.textContent = `设置日志级别失败：${e.message}`;
+      }
+    });
   }
 }

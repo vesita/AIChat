@@ -2,13 +2,98 @@
 // 目录结构：
 //   data/memory/group_<群号>/<QQ>.json
 //   data/memory/private_<QQ>/<QQ>.json
-// 每个成员文件：{ userId, name, impressions: [{ content, createdAt }], updatedAt, lastConsolidatedAt }
+// 每个成员文件：{ userId, name, impressions: [{ content, createdAt, dim?, origin?, sessionId? }], updatedAt, lastConsolidatedAt }
 // 旧版单文件 data/memory/group_<群号>.json 会在首次访问时自动迁移。
 import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR, getConfig, updateConfig } from './config.js';
 
 const MEMORY_DIR = path.join(DATA_DIR, 'memory');
+
+// ── 画像 v1 的条目元数据 ────────────────────────────────────────────────
+// dim：画像维度（personality 性格 / tone 语气 / values 在意什么 / redline 雷点 /
+//      relation 关系 / fact 事实）。缺省 fact —— 旧数据没有 dim 也照常渲染。
+// origin：谁写的（model = 模型在会话里调 memory_append；consolidate = 整理管线或
+//      管理端整体替换）。旧数据没有 origin 时按 consolidate 处理 —— 不把来历不明的
+//      条目算成模型自发写入，验收归因才可信。
+// sessionId：可选，记录模型写入来自哪次运行。
+const IMPRESSION_DIMS = ['personality', 'tone', 'values', 'redline', 'relation', 'fact'];
+const ORIGINS = ['model', 'consolidate'];
+const DIM_LABELS = { personality: '性格', tone: '语气', values: '在意', redline: '雷点', relation: '关系' };
+
+// 画像渲染硬上限：最多 3 人、每人 ≤120 字、整段 ≤420 字符。
+// 段内不渲染任何时间戳/「最近互动」——【记忆】段是提示词锚点前缀的一部分，易变内容
+// 会让锚点每轮 reset，前缀缓存全废（见 src/prompt.js 的锚点注释）。
+const PORTRAIT_LIMITS = { maxMembers: 3, maxCharsPerMember: 120, maxCharsTotal: 420 };
+const PORTRAIT_HEADER = '【对群友的印象】';
+
+/** 归一化一条印象：只保留已知字段，并给 dim/origin 兜底（旧数据兼容）。 */
+function normalizeImpression(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const content = String(raw.content ?? '').slice(0, 300);
+  if (!content.trim()) return null;
+  const entry = {
+    content,
+    createdAt: Number(raw.createdAt) || 0,
+    dim: IMPRESSION_DIMS.includes(raw.dim) ? raw.dim : 'fact',
+    origin: ORIGINS.includes(raw.origin) ? raw.origin : 'consolidate'
+  };
+  if (raw.sessionId) entry.sessionId = String(raw.sessionId).slice(0, 64);
+  return entry;
+}
+
+/** 把「字符串 | {content,dim}」统一成可写入的印象对象。 */
+function toImpression(item, { origin = 'consolidate', sessionId = '', createdAt = Date.now() } = {}) {
+  const raw = typeof item === 'string' ? { content: item } : (item || {});
+  const content = String(raw.content ?? '').slice(0, 300);
+  if (!content.trim()) return null;
+  const entry = {
+    content,
+    createdAt: Number(raw.createdAt) || createdAt,
+    dim: IMPRESSION_DIMS.includes(raw.dim) ? raw.dim : 'fact',
+    origin: ORIGINS.includes(origin) ? origin : 'consolidate'
+  };
+  if (sessionId) entry.sessionId = String(sessionId).slice(0, 64);
+  return entry;
+}
+
+/** 按维度合成一个成员的画像文本（≤ maxCharsPerMember 字，段内无时间戳）。 */
+function composePortrait(member, notes = {}) {
+  const entries = [...(member.impressions || [])]
+    .filter((e) => e && String(e.content ?? '').trim())
+    .sort((a, b) => (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0));
+  if (!entries.length) return '';
+
+  // 每个结构化维度取最新 1 条；fact 取最近 3 条（与旧版「每人最近 3 条」的信息量对齐）
+  const byDim = new Map();
+  const facts = [];
+  for (const e of entries) {
+    const dim = IMPRESSION_DIMS.includes(e.dim) ? e.dim : 'fact';
+    if (dim === 'fact') facts.push(String(e.content).trim());
+    else byDim.set(dim, String(e.content).trim());
+  }
+  const parts = [];
+  for (const dim of ['personality', 'tone', 'values', 'redline', 'relation']) {
+    const v = byDim.get(dim);
+    if (v) parts.push(`${DIM_LABELS[dim]}：${v}`);
+  }
+  for (const f of facts.slice(-3)) parts.push(f);
+
+  const text = parts.join('；').replace(/\s+/g, ' ').trim();
+  return text.slice(0, PORTRAIT_LIMITS.maxCharsPerMember);
+}
+
+/** 把画像行裁到整段字符上限内（头部保留；放不下的整行丢弃 —— 不截出半个名字）。 */
+function clampPortraitLines(lines) {
+  const max = PORTRAIT_LIMITS.maxCharsTotal;
+  let out = lines[0] || '';
+  for (const line of lines.slice(1)) {
+    const next = `${out}\n${line}`;
+    if (next.length > max) break;
+    out = next;
+  }
+  return out;
+}
 
 function chatDirName(chatKey) {
   return String(chatKey).replace(/[^a-z0-9_]/gi, '_');
@@ -63,7 +148,9 @@ function loadMember(chatKey, userId, name = '') {
   return {
     userId: String(raw?.userId ?? userId ?? ''),
     name: String(raw?.name ?? name ?? ''),
-    impressions: Array.isArray(raw?.impressions) ? raw.impressions : [],
+    impressions: Array.isArray(raw?.impressions)
+      ? raw.impressions.map((e) => normalizeImpression(e)).filter(Boolean)
+      : [],
     updatedAt: Number(raw?.updatedAt) || 0,
     lastConsolidatedAt: Number(raw?.lastConsolidatedAt) || 0
   };
@@ -200,14 +287,21 @@ export class MemoryStore {
     for (const k of toDelete) map.delete(k);
   }
 
-  #appendRaw(chatKey, userId, name, content, createdAt = Date.now()) {
+  /**
+   * 追加一条原始印象（内部路径）。
+   * opts: { origin: 'model'|'consolidate'（缺省 consolidate）, dim, sessionId }
+   * 注意：这里不做去重之外的业务判断；origin 由调用入口决定，不猜。
+   */
+  #appendRaw(chatKey, userId, name, content, createdAt = Date.now(), opts = {}) {
     const map = this.#ensureChat(chatKey);
     const key = userId ? String(userId) : `_n_${memberFileName('', name)}`;
     const member = map.get(key) || loadMember(chatKey, userId, name);
-    const entry = {
-      content: String(content ?? '').slice(0, 300),
-      createdAt: Number(createdAt) || Date.now()
-    };
+    const entry = toImpression({ content, createdAt, dim: opts.dim }, {
+      origin: opts.origin === 'model' ? 'model' : 'consolidate',
+      sessionId: opts.sessionId,
+      createdAt
+    });
+    if (!entry) return null;
     if (!member.impressions.some((e) => e.content === entry.content)) {
       member.impressions.push(entry);
     }
@@ -219,13 +313,21 @@ export class MemoryStore {
     return entry;
   }
 
-  /** 记一条对群友的印象。extra: { userId, target } */
+  /**
+   * 记一条对群友的印象（模型唯一写入口）。
+   * extra: { userId, target, dim?, sessionId? } —— origin 固定为 model，
+   * 这样验收能区分「模型在会话里记的」与「整理管线生成的」。
+   */
   append(chatKey, category, content, extra = {}) {
     if (category !== 'memberImpression') return null;
     const userId = String(extra.userId ?? '').trim();
     const target = String(extra.target ?? '').trim().slice(0, 60);
     if (!userId && !target) return null;
-    return this.#appendRaw(chatKey, userId, target || userId, content);
+    return this.#appendRaw(chatKey, userId, target || userId, content, Date.now(), {
+      origin: 'model',
+      dim: extra.dim,
+      sessionId: extra.sessionId
+    });
   }
 
   /** 所有成员的印象（扁平列表，兼容旧消费方）。 */
@@ -239,7 +341,9 @@ export class MemoryStore {
           userId: String(m.userId || ''),
           target: String(m.name || m.userId || '某人'),
           content: e.content,
-          createdAt: e.createdAt
+          createdAt: e.createdAt,
+          dim: IMPRESSION_DIMS.includes(e.dim) ? e.dim : 'fact',
+          origin: ORIGINS.includes(e.origin) ? e.origin : 'consolidate'
         });
       }
     }
@@ -287,10 +391,9 @@ export class MemoryStore {
     const list = Array.isArray(impressions) ? impressions : [impressions];
     const now = Date.now();
     const entries = list
-      .map((s) => String(s ?? '').trim())
+      .map((item) => toImpression(item, { origin: 'consolidate', createdAt: now }))
       .filter(Boolean)
-      .slice(0, 20)
-      .map((content) => ({ content: content.slice(0, 300), createdAt: now }));
+      .slice(0, 20);
     const member = {
       userId: uid,
       name: finalName,
@@ -327,10 +430,9 @@ export class MemoryStore {
     const list = Array.isArray(contents) ? contents : [contents];
     const now = Date.now();
     const impressions = list
-      .map((s) => String(s ?? '').trim())
+      .map((item) => toImpression(item, { origin: 'consolidate', createdAt: now }))
       .filter(Boolean)
-      .slice(0, 20)
-      .map((content) => ({ content: content.slice(0, 300), createdAt: now }));
+      .slice(0, 20);
     const member = {
       userId: uid,
       name: finalName,
@@ -449,24 +551,54 @@ export class MemoryStore {
   }
 
   /**
-   * 生成提示词里的【对群友的印象】摘要。
-   * opts.userIds 提供时只包含这些成员（相关成员注入，控制 token）。
+   * 生成提示词里的【对群友的印象】画像段。
+   *
+   * userIds 是**优先级顺序**（prompt.js 按「被 @/被引用 > 触发批最后发言者 >
+   * 已读窗口最近互动者」排好）：决定谁进入画像（最多 3 人）；渲染顺序仍用
+   * members() 的稳定序（updatedAt 降序）——【记忆】段是锚点前缀的一部分，
+   * 同一成员集必须逐字节稳定，否则锚点每轮 reset、前缀缓存全废。
+   *
+   * 硬上限：最多 3 人、每人 ≤120 字、整段 ≤420 字符；段内不渲染任何时间戳。
+   * 没有任何画像内容时返回 ''（调用方不许注入空段/空标题）。
    */
   formatForPrompt(chatKey, { userIds = null } = {}) {
     const notes = getConfig().memberNotes || {};
     const all = this.members(chatKey);
     if (!all.length) return '';
-    const filter = userIds ? new Set([...userIds].map(String)) : null;
-    const picked = filter
-      ? all.filter((m) => !m.userId || filter.has(String(m.userId)))  // 无 QQ 号的旧数据始终带上
-      : all.slice(0, 15);
-    if (!picked.length) return '';
-    const lines = ['【对群友的印象】'];
-    for (const m of picked) {
-      const who = notes[String(m.userId)] || m.name || String(m.userId || '') || '某人';
-      for (const e of m.impressions.slice(-3)) lines.push(`- ${who}：${e.content}`);
+
+    const order = Array.isArray(userIds)
+      ? [...new Set(userIds.map((u) => String(u ?? '').trim()).filter(Boolean))]
+      : (userIds ? [...new Set([...userIds].map(String))] : null);
+
+    let picked;
+    if (!order) {
+      picked = all.slice(0, PORTRAIT_LIMITS.maxMembers);
+    } else {
+      const rank = new Map(order.map((uid, i) => [uid, i]));
+      picked = all
+        .filter((m) => !m.userId || rank.has(String(m.userId)))   // 无 QQ 号的旧数据始终带上
+        .sort((a, b) => {
+          const ra = a.userId ? rank.get(String(a.userId)) : Number.MAX_SAFE_INTEGER;
+          const rb = b.userId ? rank.get(String(b.userId)) : Number.MAX_SAFE_INTEGER;
+          return ra - rb;
+        })
+        .slice(0, PORTRAIT_LIMITS.maxMembers);
     }
-    return lines.join('\n');
+    if (!picked.length) return '';
+
+    // 渲染顺序 = members() 稳定序，而不是传入的优先级顺序（前缀缓存要求）
+    const pickedKeys = new Set(picked.map((m) => String(m.userId || m.name || '')));
+    const lines = [PORTRAIT_HEADER];
+    for (const m of all) {
+      const key = String(m.userId || m.name || '');
+      if (!pickedKeys.has(key)) continue;
+      const text = composePortrait(m);
+      if (!text) continue;
+      const who = notes[String(m.userId)] || m.name || String(m.userId || '') || '某人';
+      lines.push(`- ${who}：${text}`);
+    }
+    if (lines.length === 1) return '';
+    return clampPortraitLines(lines);
   }
 
   // ── 自动整理（consolidation）──
@@ -524,15 +656,15 @@ export class MemoryStore {
   replaceConsolidated(chatKey, next) {
     const cut = (s, n) => String(s ?? '').trim().slice(0, n);
     const now = Date.now();
-    const groups = new Map(); // key -> { userId, name, contents }
+    const groups = new Map(); // key -> { userId, name, items: [{content, dim}] }
     for (const item of Array.isArray(next?.memberImpression) ? next.memberImpression.slice(0, 15) : []) {
       const content = cut(item?.content, 300);
       if (!content) continue;
       const userId = cut(item?.userId, 40) || '';
       const name = cut(item?.target, 60) || userId;
       const key = userId || `_n_${memberFileName('', name)}`;
-      if (!groups.has(key)) groups.set(key, { userId, name, contents: [] });
-      groups.get(key).contents.push(content);
+      if (!groups.has(key)) groups.set(key, { userId, name, items: [] });
+      groups.get(key).items.push({ content, dim: IMPRESSION_DIMS.includes(item?.dim) ? item.dim : 'fact' });
     }
     const map = this.#ensureChat(chatKey);
     // 整理前把整个会话文件夹备份到 data/memory/backups/<会话>/（保留最近一次）
@@ -553,8 +685,8 @@ export class MemoryStore {
     }
     map.clear();
     for (const g of groups.values()) {
-      for (const content of g.contents) {
-        this.#appendRaw(chatKey, g.userId, g.name, content, now);
+      for (const item of g.items) {
+        this.#appendRaw(chatKey, g.userId, g.name, item.content, now, { origin: 'consolidate', dim: item.dim });
       }
       const file = memberFile(chatKey, g.userId, g.name);
       const member = loadMember(chatKey, g.userId, g.name);

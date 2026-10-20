@@ -8,9 +8,12 @@
 | 可写数据 | `/var/lib/aichat/data`（`QQ_AGENT_DATA_DIR`） |
 | AIChat 服务 | `aichat.service`（系统级，`127.0.0.1:3210`） |
 | NapCat 服务 | `napcat.service`（**用户级** quadlet，`systemctl --user`） |
+| 协议端端口 | OneBot **WS** `127.0.0.1:3001`（AIChat 连接）+ **HTTP API** `127.0.0.1:3002`（发送/查询）；`snowluma.wsUrl` / `snowluma.httpUrl` 两个都要配 |
 | 机器人账号 | `<BOT_QQ>`（昵称由 QQ 侧决定） |
 | 模型 | `deepseek-flash` @ `<MODEL_BASE_URL>` |
 | 白名单 | 群 `<GROUP_ID_1>`（主群）、`<GROUP_ID_2>`（次群）；私聊 `<OWNER_QQ>` |
+
+只填 ws 不填 http 是最常见的半通故障：WS 绿、发送 404。
 
 ## 改配置：热更新，不用重启
 
@@ -35,7 +38,7 @@ curl -X POST http://127.0.0.1:3210/api/config \
 systemctl is-active aichat
 XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active napcat.service
 
-# 机器人登录与在线状态
+# 机器人登录与在线状态（NapCat HTTP API，3002）
 curl -s -X POST http://127.0.0.1:3002/get_status -d '{}' -H 'content-type: application/json'
 
 # 看最近收到的消息（实时）

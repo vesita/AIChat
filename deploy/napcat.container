@@ -38,6 +38,14 @@ PublishPort=127.0.0.1:3001:3001
 PublishPort=127.0.0.1:3002:3002
 Volume=%h/napcat/qq:/app/.config/QQ:Z
 Volume=%h/napcat/config:/app/napcat/config:Z
+# 容器级停止宽限。man quadlet 要求它**低于** [Service] 的 TimeoutStopSec（这里 90），
+# 否则超时的是 systemd 先把 podman rm 杀掉，而不是 podman 自己收尾 —— 所以取 80。
+# 为什么两条都要：# [Service] 那条只约束 systemd 等 ExecStop 里那个 *podman 进程* 返回的时长，
+# 而 quadlet 生成的 ExecStop 是 `podman rm -v -f`，它按容器自己的 StopTimeout 等（默认 10 秒）
+# 就对容器 SIGKILL 并正常返回 —— 上面的 90 秒因此从来没有机会被用到。
+# 实测（2026-10-20）：4 次带 Stopping 的停止里 3 次在 10.5/12.5/11.5 秒出现退出码 137，
+# podman 自认 "failed to stop container napcat in 10 seconds, resorting to SIGKILL" 7 次。
+StopTimeout=80
 
 [Service]
 Restart=always

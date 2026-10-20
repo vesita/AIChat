@@ -1,7 +1,9 @@
 # 部署 AIChat（headless）
 
 无头部署（不装 Electron、不跑 Windows 协议端）。QQ 协议端由 NapCat 容器提供，
-AIChat 只做一个 OneBot v11 客户端。
+AIChat 只做一个 OneBot v11 客户端。协议端有两个端口：**WS `127.0.0.1:3001`** +
+**HTTP API `127.0.0.1:3002`**，AIChat 的 `snowluma.wsUrl` / `snowluma.httpUrl` 两个都要配。
+只填 ws 不填 http 是最常见的半通故障：WS 绿、发送 404。
 
 ## 落点
 
@@ -20,8 +22,10 @@ AIChat 只做一个 OneBot v11 客户端。
 sudo bash deploy/install.sh
 ```
 
-前提：node ≥ 20、git、curl；NapCat 已在 `127.0.0.1:3001` 提供 OneBot。
-部署后控制台是空的配置，需要在里面填模型 API、白名单群、响应档位。
+前提：node ≥ 20、git、curl；NapCat 容器已在跑（`deploy/napcat.container`），
+OneBot **WS** 在 `127.0.0.1:3001`、**HTTP API** 在 `127.0.0.1:3002`。
+部署后控制台是空的配置，需要在里面填协议端 WS/HTTP 两个地址（3001/3002）、模型 API、白名单群、响应档位。
+`npm run setup` 是 Windows 桌面版的安装器，Linux 上会直接退出并指向容器方案。
 
 ## 更新（热更新）
 

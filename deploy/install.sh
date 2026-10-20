@@ -5,7 +5,9 @@
 #   可写数据  /var/lib/aichat/data  QQ_AGENT_DATA_DIR
 #   控制台    127.0.0.1:3210        只回环
 #
-# 前置：node ≥ 20、git、curl；NapCat 已在跑（OneBot 在 127.0.0.1:3001）。
+# 前置：node ≥ 20、git、curl；NapCat 容器已在跑。OneBot 有两个端口：WS 127.0.0.1:3001、
+#       HTTP API 127.0.0.1:3002 —— AIChat 的 snowluma.wsUrl 与 snowluma.httpUrl 两个都要配；
+#       只填 ws 不填 http 是最常见的半通故障（WS 绿、发送 404）。
 # 退出码：0 部署完成 / 1 某步失败 / 2 前置不满足
 set -uo pipefail
 

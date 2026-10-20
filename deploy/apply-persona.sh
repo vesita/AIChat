@@ -4,8 +4,9 @@
 # 为什么用 systemPromptOverride 而不是改 roleText：
 #   roleText 只换人设正文，src/prompt.js 里硬编码的 antiAiFlavor()（"可以先反问、阴阳、
 #   装傻、拒绝"）、subjectivity()、speakOrNot() 仍然生效 —— 实测光换角色卡压不住毒舌。
-#   systemPromptOverride 会整体替换人格/风格准则，只强制保留 securityRules() 与
-#   toolProtocol()，这才是「重写一个角色」。
+#   systemPromptOverride 只整体替换人格/风格准则；【安全规则】【工作方式】与机制段
+#   （记忆维护等，见 src/prompt.js 的 mechanismSections()）由核心强制保留 ——
+#   这是「重写一个角色」，不是把整套机制也换掉。
 #
 # 用法：apply-persona.sh [文件名]     默认 xiaojingyu-friendly.md
 # 退出码：0 已注入并验证 / 1 注入后验证不过 / 2 前置不满足
