@@ -49,3 +49,7 @@ release/
 community.key
 
 .goal-baseline/
+
+# NapCat 现场取值（QQ 号 / 密码 / 固定 MAC）—— 只提交 example
+napcat.env
+napcat/napcat.env

@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 /**
- * QQ Agent 一键 setup 脚本：下载 SnowLuma + 安装固定版本 QQ 便携实例。
+ * QQ Agent 一键 setup 脚本（Windows 桌面版）：下载 SnowLuma + 安装固定版本 QQ 便携实例。
  *
  *   npm run setup              # 首次安装（已就绪则跳过）
  *   node scripts/setup.mjs --force     # 强制重新下载
  *   node scripts/setup.mjs --check     # 只检查是否就绪
  *   node scripts/setup.mjs --skip-qq   # 只装 SnowLuma，跳过 QQ 下载
+ *
+ * 只支持 Windows：这里装的是 Windows 版 SnowLuma / 便携 QQ。Linux 部署的协议端是
+ * 外部 OneBot 端点（NapCat 容器，见 deploy/napcat.container），本脚本在非 win32 直接退出。
  *
  * 不入库任何腾讯二进制。QQ 安装包从腾讯 CDN 实时下载（用户自行触发）。
  * SnowLuma 为独立第三方项目，按其许可分发。
@@ -124,6 +127,20 @@ const NO_PORTABLE = args.includes('--no-portable');
 const log = (...a) => console.log('[setup]', ...a);
 const warn = (...a) => console.warn('[setup] ⚠', ...a);
 const die = (msg) => { console.error('[setup] ❌', msg); process.exit(1); };
+
+// ── 平台闸（必须在任何网络请求 / 文件写入之前）──────────────────────────
+// 本脚本安装的是 **Windows 版** SnowLuma 与 Windows 便携 QQ。Linux 部署的协议端是
+// 外部 OneBot 端点（NapCat 容器，见 deploy/napcat.container）——Windows 二进制在 Linux
+// 上跑不起来，装进去只会把控制台带进错误的「内置协议端」叙事。
+// --check 例外：它只读，外部模式下要给出明确结论（exit 0），不能把「缺失」当失败。
+const IS_WIN32 = process.platform === 'win32';
+if (!IS_WIN32 && !CHECK_ONLY) {
+  die('本脚本只支持 Windows 桌面版（它会安装 Windows 版 SnowLuma/QQ）。\n'
+    + '  Linux 上协议端是外部 OneBot 端点：用 deploy/napcat.container 起 NapCat 容器，\n'
+    + '  再把 snowluma.wsUrl 指到它的 WS 口（默认 3001）、snowluma.httpUrl 指到 HTTP 口（默认 3002）。\n'
+    + '  只填 ws 不填 http 是最常见的半通故障：WS 绿、发送 404。\n'
+    + '  （只读检查用 node scripts/setup.mjs --check。）');
+}
 
 // ── 工具函数 ──
 
@@ -891,6 +908,15 @@ function findFileRecursive(dir, filename) {
 
 async function main() {
   if (CHECK_ONLY) {
+    if (!IS_WIN32) {
+      // 外部协议端模式：本机没有「内置 SnowLuma / 便携 QQ」可检查，缺失不是失败。
+      // 这条只读检查的成败判据是「是否说清了协议端形态」，不是「是否装了 Windows 协议端」。
+      log('协议端：外部（非 Windows 平台，跳过 SnowLuma/便携 QQ 检查）');
+      log('  Linux 上协议端由容器提供：deploy/napcat.container');
+      log('  snowluma.wsUrl → 容器 WS 口（默认 3001）；snowluma.httpUrl → HTTP 口（默认 3002）');
+      log('  只填 ws 不填 http 是最常见的半通故障：WS 绿、发送 404');
+      return;
+    }
     const sl = isSnowlumaReady();
     const qq = isQqPortableReady();
     log(`SnowLuma: ${sl ? '✅ 就绪' : '❌ 缺失'}`);

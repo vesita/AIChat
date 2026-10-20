@@ -284,7 +284,7 @@ QQ_AGENT_DEV=1 npm run server
 | 给别的 Skill 提供可复用的实现 | `providers` | 对方按能力名软依赖你 |
 | 实现某个**核心已在找**的标准能力 | `providers` | 核心会主动来找（见 8.4 的清单） |
 
-**核心当前实际消费的能力名（14 个，已核对源码）**：
+**核心当前实际消费的能力名（16 个，已核对源码）**：
 
 ```
 video.frames              video-reader.js
@@ -301,6 +301,8 @@ llm.response              manager → llm.js
 llm.usage                 manager → llm.js
 llm.retry-advisor         manager → llm.js
 tool.guard                manager → tool-registry.js
+reply.interest-judge      orchestrator.js（触发判定扩展点）
+message.card-text         onebot.js（卡片 json/xml 段展开）
 ```
 
 > 📌 **换句话说：想接入 LLM，只有一条路 —— 注册工具。**
@@ -309,13 +311,13 @@ tool.guard                manager → tool-registry.js
 
 ### 1.9 本项目的实际约定（观测结果）
 
-| | `skills/`（12 个） | `plugins/`（3 个） |
+| | `skills/`（0 个） | `plugins/`（2 个） |
 |---|---|---|
-| 注册工具数 | **0** | **4** |
-| 提供能力 | 全部 12 个都有 | 无 |
-| 提示词片段 | 部分有 | 全部有 |
+| 注册工具数 | **0** | **0** |
+| 提供能力 | — | 3 个（`reply.interest-judge`、`reply.local-policy`、`llm.usage`） |
+| 提示词片段 | — | 无 |
 
-30 个工具里 26 个来自核心 `src/tools.js`，4 个来自 `plugins/` 下的旧插件。也就是：
+当前检出里全部工具都来自核心 `src/tools.js`；`plugins/` 下的两个自带插件只提供能力/钩子，不注册工具。也就是：
 
 > **核心提供工具（模型看到的 API 面），技能提供能力的实现（背后插拔）。**
 
@@ -666,6 +668,8 @@ tool.guard
 | `image.random` | 随机图 | 图片工具 |
 | `media.download.bilibili` / `media.download.douyin` | 下载结果 | 视频下载 |
 | `llm.endpoint-pick` / `llm.endpoint-feedback` / `llm.endpoint-snapshot` | 端点选择/反馈 | 账号池 |
+| `message.card-text` | `[卡片: …]` 文本，或 `null`（回落内置解析） | 消息入库（`onebot.js`） |
+| `reply.interest-judge` | `{ respond, reason? }`；`undefined`/非法返回 = 不干预（回落核心判定） | 触发判定链（`orchestrator.js`） |
 
 > 自建能力名建议用「点分层级」格式（如 `my-tool.convert`），避免与内置冲突。
 

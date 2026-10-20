@@ -25,6 +25,76 @@ function currentGifRoute() {
   return resolveGifRoute({ vision: cfg.api?.vision !== false, video: cfg.api?.video === true });
 }
 
+// ── 工具执行超时 / 中止穿透（T-1）────────────────────────────────────────
+// 工具背后可能是网络请求、子进程或插件代码，任何一处不返回都会让整条会话永久
+// 停在「正在思考」并占住并发槽（默认只有 2 个）。超时预算默认 120 秒，可用
+// tools.timeoutMs 覆盖；若模型单请求超时（api.timeoutMs，默认 180s）更短则跟着它走。
+const DEFAULT_TOOL_TIMEOUT_MS = 120000;
+// 负向对照开关（仅测试用）：COREFIX_T1=0 回到"直接 await、无超时无中止"的旧行为。
+// 生产不设该环境变量 → 修复恒开。
+const FIX_TOOL_TIMEOUT = process.env.COREFIX_T1 !== '0';
+
+/** 工具执行超时预算（毫秒；0 = 不限）。 */
+function toolExecutionTimeoutMs() {
+  const cfg = getConfig();
+  const raw = cfg.tools?.timeoutMs;
+  if (raw === null || raw === undefined || raw === '') {
+    const apiTimeout = Math.max(0, Number(cfg.api?.timeoutMs) || 0);
+    // 默认不超过模型单请求超时：工具挂住时没必要等得比模型还久。
+    return apiTimeout > 0 ? Math.min(DEFAULT_TOOL_TIMEOUT_MS, apiTimeout) : DEFAULT_TOOL_TIMEOUT_MS;
+  }
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.max(0, n) : DEFAULT_TOOL_TIMEOUT_MS;
+}
+
+/**
+ * 给一次工具执行套上「超时 + 中止」竞速。
+ *
+ * 竞速的承诺只有一条：**调用方一定会在预算内拿回结果**。底层工具可能永远不返回
+ * （网络挂起 / Skill 死循环 / 子进程卡住），我们无法强杀它，但可以不再等它 ——
+ * 返回值带 timedOut / aborted 标记，由调用方决定如何收尾并释放并发槽。
+ *
+ * @returns {Promise<{content, isError, timedOut?, aborted?, timeoutMs?}>}
+ */
+async function executeWithDeadline(execute, { name, timeoutMs, signal }) {
+  const timeout = Math.max(0, Number(timeoutMs) || 0);
+  const hasAbort = Boolean(signal && typeof signal.addEventListener === 'function');
+  if (!timeout && !hasAbort) return execute();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    let onAbort = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      fn(value);
+    };
+    if (hasAbort) {
+      onAbort = () => finish(resolve, {
+        content: `工具执行已中止：${name}`,
+        isError: true,
+        aborted: true
+      });
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    if (timeout > 0) {
+      timer = setTimeout(() => finish(resolve, {
+        content: `工具执行超时：${name} 超过 ${timeout}ms 未返回`,
+        isError: true,
+        timedOut: true,
+        timeoutMs: timeout
+      }), timeout);
+      // 不把进程退出拖住：调用方在等这个 promise，定时器本身不需要保活。
+      timer.unref?.();
+    }
+    // 同步抛错也走同一收尾路径；超时后底层再 reject 也不会变成 unhandled rejection。
+    execute().then((value) => finish(resolve, value), (error) => finish(reject, error));
+  });
+}
+
 async function downloadImageAsDataUrl(url, timeoutMs = 30000) {
   const safeUrl = await validateImageUrl(url);
   const { buffer, contentType } = await safeFetchBinary(safeUrl);
@@ -182,6 +252,10 @@ function registerAllTools() {
         ctx.session.sent.push(...result.sent.map((s) => ({ type: 'text', text: s.text, at: s.at })));
         ctx.emit('session-update', ctx.session.id);
         const note = ['已发送。不要输出"已发送"类汇报，继续思考下一步或直接结束。'];
+        // D-1：被发送去重拦下的条目（上一次超时/结果不确定，可能已经送达）必须
+        // 明确告诉模型"别重发"，否则它会把 note 当成失败继续补发。
+        const skipped = result.sent.filter((s) => s?.deduped).length;
+        if (skipped) note.push(`（其中 ${skipped} 条与刚发出或"可能已送达"的内容相同，已跳过，不要再重发）`);
         if (result.failed.length) note.push(`（另有 ${result.failed.length} 条发送失败：${result.failed.map((f) => f.error).join('；')}——成功的不需要重发，失败的请稍后再试或减少条数）`);
         return ok({ sent: result.sent.length, messageIds: result.sent.map((s) => s.messageId), note: note.join('') });
       } catch (error) {
@@ -1238,7 +1312,14 @@ export async function executeTool(defs, ctx, name, argsJson) {
     return { content: `错误：工具 ${name} 的参数不是合法 JSON：${String(raw).slice(0, 200)}`, isError: true };
   }
   try {
-    return await def.execute(ctx, args ?? {});
+    if (!FIX_TOOL_TIMEOUT) return await def.execute(ctx, args ?? {});
+    // 超时 + 中止都必须在工具执行期间生效：只要工具不返回，就靠这个竞速收尾，
+    // 否则会话会永久占住并发槽（见文件头 executeWithDeadline 的说明）。
+    return await executeWithDeadline(() => def.execute(ctx, args ?? {}), {
+      name,
+      timeoutMs: toolExecutionTimeoutMs(),
+      signal: ctx?.abortSignal || null
+    });
   } catch (error) {
     return { content: `错误：${error?.message ?? error}`, isError: true };
   }

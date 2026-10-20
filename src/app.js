@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { getConfig, updateConfig, ROOT, DATA_DIR } from './config.js';
+import { getConfig, updateConfig, ROOT, DATA_DIR, resolveProtocolMode } from './config.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments, expandForwardNodes } from './onebot.js';
 import { isAtMe } from './prompt.js';
 import { ChatStore } from './store.js';
@@ -25,6 +25,8 @@ import { loadPlugins, watchPlugins } from './plugin-loader.js';
 import { skillManager } from './skills/manager.js';
 import { extractCandidateUrls, dispatchMediaLinks } from './media-links.js';
 import { createRoutes } from './routes.js';
+import { createQQLogin, createQQLoginHandlers } from './qq-login.js';
+import { createProtocolSide, createProtocolSideHandlers } from './protocol-side.js';
 import * as instanceLockModule from './instance-lock.js';
 import { logger } from './logger.js';
 import { startCommunitySync, isGloballyBlocked, FIXED_PRICE_FEED_URL } from './community.js';
@@ -57,6 +59,10 @@ function allowed(kind, id, cfg) {
 // 线上版本信息只有一份：kondius.cn/qq-agent/version.json（发版时手动改）。
 // 由后端代取而不是前端直连：绕过 CORS，且失败信息能统一回给 UI。
 const UPDATE_INFO_URL = 'https://kondius.cn/qq-agent/version.json';
+
+// HTTP 数据面探针超时：只是判"像不像 OneBot"，一次 POST 不让 /api/status 或
+// 出站报错路径等太久（超时本身也是结论：不可达）。
+const HTTP_PROBE_TIMEOUT_MS = 5000;
 
 function localVersion() {
   try {
@@ -637,6 +643,137 @@ export function createApp({ log = console.log } = {}) {
     httpToken: cfg.snowluma?.httpAccessToken || cfg.snowluma?.accessToken,
     onEvent: (event) => handleOneBotEvent(event).catch((error) => log('[ingest] 处理事件出错:', error?.message ?? error))
   });
+
+  // ── HTTP 数据面自检（S3）+ 出站错误可读（S5）────────────────────────────
+  //
+  // 判据分工（硬约束；test/protocol-diag-test.mjs 有静态守卫）：
+  //   · 本探针**只**回答「HTTP 数据面像不像 OneBot」：状态码 / content-type / JSON 形状；
+  //   · 本探针**不判登录态**、也不判僵尸态 —— 那是 onebot.dataPathStatus() 的
+  //     get_csrf_token + get_friend_list 判据（src/onebot.js 的 judgeDataPath）。
+  //   · get_login_info 在僵尸态仍回 online:true，拿它判登录态会把"数据通道已死"
+  //     判成"一切正常"。所以本探针结论只进 /api/status 的 onebot.httpOk/httpError
+  //     与诊断文案，**绝不回写 OneBotClient、绝不参与 connected 判定**。
+  //   · 探针只产生结论，不产生任何恢复动作：不重连、不扫码、不停协议端
+  //     （与 task-6 探活同样的"只上报"纪律）。
+  let httpDataPath = { ok: null, error: '', url: '', status: null, checkedAt: null };
+  let httpProbeInFlight = null;
+
+  /** 当前 HTTP 数据面探针快照（/api/status / SSE 用；未知态 ok=null，不共用 false）。 */
+  function httpDataPathStatus() {
+    return { ...httpDataPath };
+  }
+
+  /** fetch 的 cause 链 → 人话（ECONNREFUSED / TimeoutError 等真因都在 cause 里）。 */
+  function describeFetchError(error) {
+    const parts = [];
+    let cur = error;
+    for (let i = 0; cur && i < 4; i++) {
+      const piece = `${cur.code ? `[${cur.code}] ` : ''}${String(cur.message || cur.name || '').trim()}`.trim();
+      if (piece && !parts.includes(piece)) parts.push(piece);
+      cur = cur.cause;
+    }
+    return parts.filter((p) => p && p !== 'fetch failed').join(' ← ')
+      || parts.join(' ← ') || String(error?.message ?? error);
+  }
+
+  /**
+   * HTTP 数据面探针：POST `httpUrl/get_login_info`，只判「像不像 OneBot」。
+   * 每次 WS 连上/重连后触发；出站失败时也复用（拿得到响应体的唯一途径）。
+   * 并发去重：同一时刻只跑一次，失败也不会抛给调用方（结论本身是数据）。
+   */
+  function probeHttpDataPath(reason = 'connect') {
+    if (httpProbeInFlight) return httpProbeInFlight;
+    httpProbeInFlight = (async () => {
+      const snowluma = getConfig().snowluma || {};
+      const base = String(onebot.httpUrl || snowluma.httpUrl || '').replace(/\/+$/, '');
+      const token = String(onebot.httpToken || snowluma.httpAccessToken || snowluma.accessToken || '');
+      const url = base ? `${base}/get_login_info` : '';
+      const record = (patch) => {
+        const prev = httpDataPath;
+        httpDataPath = { ...prev, ...patch, reason };
+        // 半通/恢复都推 SSE：控制台红灯不必等下一次轮询。
+        if (prev.ok !== httpDataPath.ok || prev.error !== httpDataPath.error) {
+          emit('onebot-http', httpDataPathStatus());
+        }
+        return httpDataPath;
+      };
+      if (!base) {
+        return record({ ok: false, url: '', status: null, error: '未配置 snowluma.httpUrl，无法探测 HTTP 数据面' });
+      }
+      let res;
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            ...(token ? { authorization: `Bearer ${token}` } : {})
+          },
+          body: '{}',
+          signal: AbortSignal.timeout(HTTP_PROBE_TIMEOUT_MS)
+        });
+      } catch (error) {
+        return record({ ok: false, url, status: null, error: `HTTP 数据面不可达：POST ${url} 失败（${describeFetchError(error)}）` });
+      }
+      const contentType = String(res.headers.get('content-type') || '');
+      const raw = await res.text().catch(() => '');
+      const excerpt = raw.replace(/\s+/g, ' ').trim().slice(0, 200);
+      const where = `POST ${url} → HTTP ${res.status}${contentType ? `（content-type=${contentType}）` : ''}`;
+      if (!res.ok) {
+        return record({ ok: false, url, status: res.status, error: `HTTP 数据面不像 OneBot：${where}，响应前 200 字符：${excerpt || '（空响应）'}` });
+      }
+      if (!/json/i.test(contentType)) {
+        return record({ ok: false, url, status: res.status, error: `HTTP ${res.status} 不是 JSON（content-type=${contentType || '空'}），不像 OneBot：${where}，响应前 200 字符：${excerpt || '（空响应）'}` });
+      }
+      let body = null;
+      try { body = JSON.parse(raw); } catch { body = null; }
+      const shapeOk = !!body && typeof body === 'object'
+        && (body.status === 'ok' || body.retcode === 0)
+        && !!body.data && typeof body.data === 'object'
+        && body.data.user_id !== undefined;
+      if (!shapeOk) {
+        return record({ ok: false, url, status: res.status, error: `HTTP 200 JSON 但形状不像 OneBot（status=${body?.status ?? '无'} retcode=${body?.retcode ?? '无'} data.user_id=${body?.data?.user_id ?? '无'}）：${where}，响应前 200 字符：${excerpt || '（空响应）'}` });
+      }
+      return record({ ok: true, url, status: res.status, error: '' });
+    })().finally(() => { httpProbeInFlight = null; });
+    return httpProbeInFlight;
+  }
+
+  // S5：出站失败的错误信息必须自解释（实际 URL + 状态码 + 响应前 200 字符）。
+  //
+  // onebot.js 的 call() 只报 `OneBot <action> HTTP 404` 裸状态码，而该文件是
+  // task-6 的写域（本任务禁止改它）。所以在装配面对实例方法做一层装饰：所有
+  // 出站（sender / orchestrator / 路由的手工发送）共用同一份增强逻辑，增强材料
+  // 来自一次真实 HTTP 探针（只有它拿得到响应体，不靠猜字符串）。
+  // 不改 onebot.js、不在别处复制它的 HTTP 实现 —— 装饰器只追加诊断信息。
+  const rawOnebotCall = onebot.call.bind(onebot);
+  onebot.call = async (action, params = {}, timeoutMs = null) => {
+    try {
+      return await rawOnebotCall(action, params, timeoutMs);
+    } catch (error) {
+      const message = String(error?.message ?? error);
+      // 只增强"HTTP 数据面层"的失败；参数校验/业务错误原样抛。
+      if (!/^OneBot .*(HTTP \d{3}|超时|请求失败)/.test(message)) throw error;
+      const probe = await probeHttpDataPath('outbound-error').catch(() => null);
+      const detail = probe
+        ? `实际 httpUrl=${onebot.httpUrl || '(空)'}；HTTP 数据面探针：${probe.error || `HTTP ${probe.status} 返回合法 OneBot JSON`}`
+        : `实际 httpUrl=${onebot.httpUrl || '(空)'}；HTTP 数据面探针未执行`;
+      const wrapped = new Error(`${message}（${detail}）`);
+      wrapped.cause = error;
+      throw wrapped;
+    }
+  };
+
+  /** 协议端形态（外部协议端模式的唯一判定点，见 config.resolveProtocolMode）。 */
+  function protocolMode() {
+    const snowluma = getConfig().snowluma || {};
+    return resolveProtocolMode({
+      dir: snowlumaDir(),
+      autoLaunch: snowluma.autoLaunch,
+      wsUrl: snowluma.wsUrl,
+      httpUrl: snowluma.httpUrl,
+      explicitMode: snowluma.mode
+    });
+  }
   const stickers = new StickerManager(onebot);
   const sender =   new SendQueue({
     onebot, store,
@@ -654,8 +791,23 @@ export function createApp({ log = console.log } = {}) {
   const communitySyncTimer = startCommunitySync(log);
   communitySyncTimer.unref?.();
 
-  // OneBot 连接状态推送
-  onebot.onStatus((status) => emit('onebot-status', status));
+  // OneBot 连接状态推送 + HTTP 数据面自检触发。
+  // 每次 WS 建立/重连成功后打一次 HTTP 探针：把"WS 绿、HTTP 坏"的半通形态
+  // 变成 /api/status 上可见的红灯（S3）。探针只上报，不影响连接。
+  let lastProbeConnected = false;
+  onebot.onStatus((status) => {
+    emit('onebot-status', status);
+    if (status.connected && !lastProbeConnected) {
+      probeHttpDataPath('connect').catch((error) => log('[onebot] HTTP 数据面探针失败:', error?.message ?? error));
+    }
+    lastProbeConnected = !!status.connected;
+  });
+  // 僵尸态自检（task-6 的 get_csrf_token 判据）变化 → SSE `onebot-datapath`。
+  // 载荷与 /api/status 同口径，并附上 HTTP 探针快照（两种红灯分开看）。
+  onebot.onDataPathChange((snapshot) => {
+    const http = httpDataPathStatus();
+    emit('onebot-datapath', { ...snapshot, httpOk: http.ok, httpError: http.error });
+  });
 
   // ── 从 SnowLuma 配置自动同步 OneBot 令牌 ──
   // SnowLuma 给每个登录过的账号生成独立随机 token（config/onebot_<uin>.json），
@@ -1161,7 +1313,8 @@ export function createApp({ log = console.log } = {}) {
   // ── 来源校验（CSRF / DNS rebinding 防护）────────────────────────────────
   // 服务只监听回环，但**浏览器里的任意网页都能向 127.0.0.1 发简单请求**，
   // 而 CORS 只挡"读响应"、挡不住"副作用"（改配置、暂停、重置数据…）。
-  // 所以所有 /api/* 都必须来自回环 Host；带 Origin/Referer 时必须同源。
+  // 所以直连请求：Host 必须是回环（防 DNS rebinding），带 Origin/Referer 时必须同源。
+  // 经 AccessTrust 数据面转发的请求按「网关标记头」识别后放行，见 originAllowed()。
   function isLoopbackHostHeader(host) {
     return /^127\.0\.0\.1(:\d+)?$/.test(host)
       || /^localhost(:\d+)?$/.test(host)
@@ -1169,7 +1322,24 @@ export function createApp({ log = console.log } = {}) {
   }
 
   function originAllowed(req) {
+    // ── 网关链路标记 ──────────────────────────────────────────────────────
+    // AccessTrust 数据面转发时会**无条件**补这组头（accesstrust/backend/src/
+    // gateway/data_plane.rs 的 forward()）：x-forwarded-proto: "https"，以及
+    // x-real-ip / x-forwarded-for（客户端 IP）。浏览器伪造不出来 —— 跨域带自定义
+    // 请求头会先触发 CORS 预检，而本服务不接 CORS（预检必失败）；no-cors 模式下
+    // 自定义头会被浏览器直接丢弃。本机进程能伪造这组头，但本机进程在可信边界内：
+    // 服务只监听 127.0.0.1，能直连它的本机进程本来就能改配置/读数据。
+    //
+    // 为什么不比对 X-Forwarded-Host：AT 的 forward() 会用它**自己收到的 Host** 覆盖
+    // x-forwarded-host，而 Caddy 反代到 AT 时 Host 已被改写成 127.0.0.1:9800 ——
+    // 这个值永远不等于浏览器 Origin 的主机名，拿它比对必然 403（实测真实链路）。
+    const gatewayProto = String(req.headers['x-forwarded-proto'] ?? '');
+    if (gatewayProto) return true;
+
+    // ── 直连 / 非网关链路：按 Host + 来源校验（CSRF / DNS rebinding 防线）──
     const host = String(req.headers.host ?? '');
+    // Host 必须是回环：进程只监听回环，Host 不是回环说明是 DNS rebinding
+    // （此时 Origin 与攻击者域名同源，光靠下面的 origin 比对拦不住）。
     if (!isLoopbackHostHeader(host)) return false;
     const origin = String(req.headers.origin ?? '');
     if (origin) {
@@ -1285,6 +1455,18 @@ export function createApp({ log = console.log } = {}) {
     return { ...rest, apiKey: '', hasKey: Boolean(String(apiKey ?? '').trim()) };
   }
 
+  // QQ 扫码登录：NapCat WebUI 客户端 + 登录状态机（src/qq-login.js）。
+  // 路由 handler 在这里构造一次并注入 routes.js；模块的鉴权由 handleHttp 的统一门负责，
+  // 回环门在 handler 层（单实现点，见 doc/audit/console-access-plan.md §11）。
+  const qqLogin = createQQLogin({ getConfig, log });
+  const qqLoginHandlers = createQQLoginHandlers({ qqLogin });
+
+  // 容器协议端（NapCat quadlet）原生管理：状态识别 + 手动 start/stop/restart（src/protocol-side.js）。
+  // 形态复用上面的 protocolMode()（唯一判定点）；动作恒走 `systemctl --user <action> <unit>`。
+  // ⚠️ 不自动拉起：模块构造纯惰性、无定时器；这里只构造实例，启动流程绝不调用任何动作。
+  const protocolSide = createProtocolSide({ getConfig, getProtocolMode: protocolMode, log });
+  const protocolSideHandlers = createProtocolSideHandlers({ protocolSide });
+
   // 声明式路由表（src/routes.js）：把所有依赖一次性注入。
   // 路由 handler 通过闭包取用这些依赖，handleHttp 只负责匹配分发。
   const apiRoutes = createRoutes({
@@ -1293,8 +1475,12 @@ export function createApp({ log = console.log } = {}) {
     localVersion, compareSemver, UPDATE_INFO_URL,
     sanitizeConfig, keyEndpointAllowed, sanitizeProvider,
     readBody, authorize,
+    qqLoginHandlers,
+    protocolSide, protocolSideHandlers,
     snowlumaDir, snowlumaWsPort, snowlumaWebuiUrl, snowlumaWebuiPort, snowlumaStatus, snowlumaLogs,
     launchSnowluma, stopSnowluma,
+    // 协议端形态单一判定点 + HTTP 数据面探针快照（见 createApp 内的定义）
+    protocolMode, httpDataPathStatus,
     qqPortableStatus, qqPortableLogs, launchPortableQQ, stopPortableQQ,
     visionScan, isPortOpen,
     buildUsageStats, buildUsageBreakdown,
@@ -1423,7 +1609,7 @@ export function createApp({ log = console.log } = {}) {
           //    CSP 浏览器取交集执行，只改一处等于没改**（本次 alicdn 加载失败即漏改此处）。
           headers['content-security-policy'] = [
             "default-src 'self'",
-            "script-src 'self' 'sha256-xBF5qExTuqfXHlYtKYaaldGJshQgQOr5zvcGHjbPL7w=' https://o.alicdn.com https://kondius.cn",
+            "script-src 'self' 'sha256-HJ5DwBIuT8nMl6SGSb24X9oSvsfDcsGPIkCgmk97V7I=' https://o.alicdn.com https://kondius.cn",
             "style-src 'self' 'unsafe-inline'",
             "img-src 'self' data: blob: http: https:",
             "media-src 'self' data: blob:",
@@ -1599,6 +1785,8 @@ export function createApp({ log = console.log } = {}) {
     orchestrator.startReminderLoop();   // 提醒（闹钟）调度：到点往群里发提醒
     log(`控制台已就绪：http://127.0.0.1:${port}`);
     log(`OneBot（SnowLuma）: ws=${getConfig().snowluma?.wsUrl} http=${getConfig().snowluma?.httpUrl}`);
+    const proto = protocolMode();
+    log(`协议端形态: ${proto.mode}（${proto.reason}）`);
     log(`模型: ${getConfig().api.model || '（未设置，请在设置里选择）'} @ ${getConfig().api.baseUrl}`);
     return port;
   }
@@ -1638,6 +1826,8 @@ export function createApp({ log = console.log } = {}) {
     try { pluginWatcher?.close?.(); } catch { /* ignore */ }
     pluginWatcher = null;
     await orchestrator.abortAll();
+    // QQ 登录模块：清凭据/在飞任务（无定时器，幂等）
+    try { qqLogin.dispose(); } catch { /* ignore */ }
     orchestrator.stopReminderLoop();
     if (communitySyncTimer) clearInterval(communitySyncTimer);
     if (obPortPollTimer) clearInterval(obPortPollTimer);

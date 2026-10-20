@@ -228,6 +228,7 @@ export const hooks = {
 | `message.speaker-format` | `prompt.js` | `{ message, notes, selfLabel }` | 字符串标签 |
 | `message.inline-at-normalize` | `onebot.js` | `{ text, members:[{userId,nickname}], atUserId }` | `string` 或 `null`（`null` = 不改） |
 | `message.owner-check` | `orchestrator.js` | `{ triggerEntries, kind, selfId, persona }` | `{ persona, rules }` |
+| `message.card-text` | `onebot.js` | `{ segment }` | `[卡片: 标题｜描述｜链接｜来源]` 或 `null`（`null` = 回落到内置解析） |
 
 ### 4.2 媒体
 
@@ -283,6 +284,7 @@ export const hooks = {
 | `reply.is-planning-text` | `src/reply-rescue.js` | `{ text }` | `{ planning: boolean }` |
 | `reply.grounded-select` | `src/reply-rescue.js`、`orchestrator.js` | `{ remember }` / `{ reset }` / `{ proposed, sent }` | `{ picked: string[] }` |
 | `reply.local-policy` | `orchestrator.js` | `{ api, entries, batch }` | `{ shouldEnd, budget, ... }` |
+| `reply.interest-judge` | `orchestrator.js` | `{ base, chatKey, kind, chatId, chatName, model, provider, visionEnabled, searchEnabled, proactive, sessionId, triggerEntries, recent, botName, selfNickname }` | `{ respond: boolean, reason?: string }`；`undefined`/非法返回 = 不干预（回落核心判定） |
 
 ### 4.6 多提供者能力
 
@@ -561,30 +563,19 @@ export const hooks = {
 
 ## 13. 本仓库现状（可直接参考的实例）
 
-### `plugins/`（确定性型，10 个）
+### `plugins/`（确定性型，2 个）
 
-| 插件 | 默认 | 提供的能力 |
+| 插件 | 默认 | 提供的能力 / 钩子 |
 |---|---|---|
-| `account-pool` | 关 | `llm.endpoint-pick`、`llm.endpoint-feedback` |
-| `ban-state` | **开** | `chat.ban-state` |
-| `image-compat` | **开** | `image.mime-support`、`llm.retry-advisor` |
-| `media-download` | 关 | `media.download` |
-| `owner-identity` | 关 | `message.owner-check` |
-| `reply-safety` | 关 | `reply.*`（7 个） |
-| `speaker-identity` | **开** | `message.speaker-format`、`message.inline-at-normalize` |
-| `speech-to-text` | 关 | `media.transcribe` |
-| `thinking-adapters` | **开** | `llm.request-params`、`llm.response`、`llm.usage`、`llm.retry-advisor`、`model.thinking-detect` |
-| `video-frames` | **开** | `video.frames`、`video.frames.available` |
+| `smart-wake` | **开**（行为开关 `settings.enabled` 默认关） | `reply.interest-judge`：本地启发式抑制刷屏/复读/命令/超短，问句或延续对话时主动接话；带冷却与小时/日上限 |
+| `token-saver` | **开** | `reply.local-policy`（纯发送批之后本地收尾，默认关）、`llm.usage`（上报裁掉的条数）、钩子 `before-llm-messages`（裁剪最旧的已读历史，`keepLast=40`） |
 
-### `skills/`（LLM 型，5 个）
+> 早期版本里的其它内置插件（账号池 / 抽帧 / 主人识别 / 禁言状态 / 图片兼容 / 思考参数…）
+> 已陆续收编进核心或移除；本检出里 `plugins/` 只有上面这两个确定性型扩展。
 
-| 技能 | 默认 | 注册的工具 |
-|---|---|---|
-| `calculator` | 开 | 计算器 |
-| `text-tools` | 开 | 文本工具（2 个） |
-| `weather-query` | 开 | 天气查询 |
-| `random-image` | 关 | 发二次元随机图 |
-| `sticker-annotate` | 关 | 表情包标注 |
+### `skills/`（LLM 型，0 个）
+
+当前检出没有 `skills/` 目录（用户自装 LLM 型扩展的落点）；技能与插件走同一条加载器。
 
 ---
 

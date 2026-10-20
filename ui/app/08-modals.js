@@ -1492,6 +1492,39 @@ async function saveConfig({ quiet = false } = {}) {
     patch.tools = state.config.tools || { enabled: true, overrides: {}, categories: {} };
   }
 
+  if (sec === 'participation') {
+    // ── 参与策略：选择 + 该策略的参数（一个 patch 同时写，避免"模式与参数对不上"）──
+    const checked = document.querySelector('input[name="pmode"]:checked');
+    const rawMode = checked ? checked.value : (c.store?.participationMode || 'probability');
+    const mode = ['probability', 'ai', 'directed'].includes(rawMode) ? rawMode : 'probability';
+    const aiNow = c.store?.aiJudge || {};
+    const limNow = c.store?.limits || {};
+    const limRaw = Number(val('#lim-maxperhour', limNow.maxMessagesPerHour ?? 2000));
+    const hcRaw = Number(val('#pm-historycount', c.store?.historyCount ?? 80));
+    const storePatch = {
+      participationMode: mode,
+      // AI 模式开关与参与策略是同一个选择：切到 ai 时同步 enabled=true，其它模式置 false。
+      // （后端 isAiJudgeMode 也认 participationMode，两处一致才不会出现"选了 AI 但没生效"。）
+      aiJudge: {
+        ...aiNow,
+        enabled: mode === 'ai',
+        minGapSec: Math.max(0, Math.min(3600, Math.floor(Number(val('#aj-mingap', aiNow.minGapSec ?? 0)) || 0))),
+        passMarker: String(val('#aj-marker', aiNow.passMarker || '[[PASS]]')).trim().slice(0, 32) || '[[PASS]]'
+      },
+      limits: {
+        ...limNow,
+        maxMessagesPerHour: Number.isFinite(limRaw) ? Math.max(0, Math.floor(limRaw)) : 2000
+      },
+      historyCount: Number.isFinite(hcRaw) ? Math.min(500, Math.max(80, Math.floor(hcRaw))) : 80
+    };
+    // 关键词表只属于「仅定向」的参数区；输入框不存在（其它模式/旧缓存）时不写，保留现值。
+    const kwEl = el('#pm-keywords');
+    if (kwEl) {
+      storePatch.keywords = String(kwEl.value || '').split('\n').map((x) => x.trim()).filter(Boolean);
+    }
+    patch.store = storePatch;
+  }
+
   // ── POST 之前的最后防线：去掉"空 patch"造成的无谓请求 ──
   // 变动监听挂在整个 #settings-form 上，点击 readonly 输入框、拖动滑条
   // 等不产生真实改动的操作也会触发一次保存。空 patch（没有任何顶层键）

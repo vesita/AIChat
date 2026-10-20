@@ -406,6 +406,21 @@ function bindSettingsEvents(c) {
   const acRoot = $('#ac-editor');
   if (acRoot) mountActiveConfigEditor(acRoot);
 
+  // ── 参与策略：模式卡片 = 单选 + 只显示选中模式的参数区 ──
+  // 三张卡片共用 name="pmode" 的 radio；change 事件会冒泡到 #settings-form，
+  // 触发既有的 dirty 自动保存（saveConfig 的 participation 分支收集新字段）。
+  const pmodeInputs = $$('input[name="pmode"]');
+  if (pmodeInputs.length) {
+    const syncPmode = () => {
+      const checked = pmodeInputs.find((x) => x.checked) || pmodeInputs[0];
+      const mode = checked ? checked.value : 'probability';
+      $$('.pmode-card').forEach((el) => el.classList.toggle('on', el.dataset.mode === mode));
+      $$('.pmode-body').forEach((el) => { el.hidden = el.dataset.pmode !== mode; });
+    };
+    pmodeInputs.forEach((x) => x.addEventListener('change', syncPmode));
+    syncPmode();
+  }
+
   // ── 屏蔽名单 ──
   $('#blocklist-btn')?.addEventListener('click', () => openBlocklistModal());
 
@@ -952,6 +967,10 @@ function bindSettingsEvents(c) {
     catch (e) { $('#snowluma-hint').textContent = `失败：${e.message}`; }
   });
 
+  // 外部协议端模式：说明卡里的「查看协议端状态」（内置模式不渲染这个按钮）
+  const gotoProtocolBtn = $('#goto-protocol-status-btn');
+  if (gotoProtocolBtn) gotoProtocolBtn.addEventListener('click', () => switchTab('snowluma'));
+
   // ── 数据管理区块事件 ──
   const openDataDirBtn = $('#open-datadir-btn');
   if (openDataDirBtn) openDataDirBtn.addEventListener('click', async () => {
@@ -984,4 +1003,29 @@ function bindSettingsEvents(c) {
     }
     resetDataBtn.disabled = false;
   });
+}
+
+/* ── hash 深链启动钩子 ────────────────────────────────────────────────────
+   两种入口：
+   1. 地址栏手改 / 粘贴带 hash 的链接 → hashchange 直接应用；
+   2. 首屏 URL 自带深链 → 必须等控制台真正就绪（appReady）：令牌输入 / QQ 扫码
+      分流还在跑时抢先切页签，会发出没带令牌的请求，还会让登录遮罩下的页面
+      提前渲染。所以只在已带 hash 时做一段有上限的就绪等待，没有 hash 的
+      正常启动完全不新增定时器。
+   switchTab 的地址栏写回在 00-core.js，这里只负责"什么时候应用"。 */
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('hashchange', () => {
+    try { applyLocationHash(); } catch (e) { console.error('[deeplink] 应用 hash 失败:', e); }
+  });
+  try {
+    if (typeof location !== 'undefined' && location.hash && typeof appReady !== 'undefined') {
+      const readyTimer = setInterval(() => {
+        if (!appReady) return;
+        clearInterval(readyTimer);
+        try { applyLocationHash(); } catch (e) { console.error('[deeplink] 首屏深链失败:', e); }
+      }, 150);
+      // 就一直绪不了（需令牌 / 要扫码登录）也别把定时器挂着：60 秒后放弃。
+      setTimeout(() => clearInterval(readyTimer), 60000);
+    }
+  } catch { /* 非浏览器环境（测试 vm / 无 location）忽略 */ }
 }

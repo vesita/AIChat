@@ -31,7 +31,8 @@ function _captchaFailAll(msg) {
 async function _ensureCaptchaSW() {
   if (!('serviceWorker' in navigator)) { window.__qqaSWStatus = 'SW不支持'; return; }
   try {
-    await navigator.serviceWorker.register('/captcha-sw.js');
+    // 按控制台基路径注册：SW 的默认 scope 是脚本所在目录，前缀挂载时才收在 /aichat/ 下
+    await navigator.serviceWorker.register(consoleUrl('/captcha-sw.js'));
     await navigator.serviceWorker.ready;   // 激活后再加载 SDK，保证拦截已生效
     window.__qqaSWStatus = 'SW已激活';
   } catch (e) {

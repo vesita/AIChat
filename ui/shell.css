@@ -1,0 +1,115 @@
+/* ══ 顶栏链路状态带 + 诊断面板（T1） ══════════════════════════════════════
+   单独成文件：ui/style.css 是公共样式，本组件的规则只放这里，避免和别的改动撞。
+
+   视觉契约（全部复用 style.css 的 token，不新造色板）：
+   · 一个胶囊按钮 = 原来「OneBot 圆点 + 4 个就绪圆点 + 串状状态胶囊」的可见替身；
+   · 状态只有三档颜色：ok / warn / err，另有首屏的 wait（中性，未判定）；
+   · 诊断面板是「仪器读数」而不是卡片墙：一行一段、发丝分隔线、证据用等宽字，
+     不加阴影嵌套、不加圆角卡片、不加编号装饰。 */
+
+#topbar { position: relative; }
+
+/* ── 状态按钮 ─────────────────────────────────────────────────────────── */
+.link-status {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 28px; padding: 0 10px 0 11px;
+  background: var(--bg2); border: 1px solid var(--bd); border-radius: var(--r-full);
+  color: var(--tx2); font: inherit; font-size: 12px; line-height: 1;
+  white-space: nowrap; cursor: pointer;
+  transition: border-color var(--t-fast) var(--ease-in-out), color var(--t-fast) var(--ease-in-out);
+}
+.link-status:hover { border-color: var(--bd2); color: var(--tx); }
+.link-status:focus-visible { outline: 2px solid var(--ac-line); outline-offset: 2px; }
+.link-status.is-ok { border-color: var(--ok-line); color: var(--tx); }
+.link-status.is-warn { border-color: var(--warn-line); color: var(--warn); }
+.link-status.is-err { border-color: var(--err-line); color: var(--err); }
+.link-status[aria-expanded='true'] { border-color: var(--ac-line); }
+
+.link-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--tx3); flex: 0 0 auto;
+}
+.link-dot.is-wait { background: var(--tx3); }
+.link-dot.is-ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.link-dot.is-warn { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+.link-dot.is-err { background: var(--err); box-shadow: 0 0 0 3px var(--err-soft); }
+
+#link-status-text { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+.link-caret {
+  color: var(--tx3); font-size: 10px; line-height: 1;
+  transition: transform var(--t-base) var(--ease-out-quart);
+}
+.link-status[aria-expanded='true'] .link-caret { transform: rotate(180deg); }
+
+/* ── 诊断面板 ─────────────────────────────────────────────────────────── */
+.link-panel {
+  position: absolute; top: calc(100% - 4px); right: 16px;
+  width: min(470px, calc(100vw - 32px));
+  padding: 12px 14px 10px;
+  background: var(--bg1); border: 1px solid var(--bd2); border-radius: var(--r-md);
+  box-shadow: var(--raise-3);
+  z-index: 40;
+  display: flex; flex-direction: column; gap: 9px;
+  animation: linkPanelIn var(--dur-base) var(--ease-out-quart);
+}
+.link-panel[hidden] { display: none !important; }
+
+.link-panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.link-panel-head strong { font-size: 13px; font-weight: 600; color: var(--tx); }
+.link-panel-hint { font-size: 11px; color: var(--tx3); }
+
+.link-rows { display: flex; flex-direction: column; }
+.link-row {
+  display: grid; grid-template-columns: 80px 6px minmax(0, 1fr) auto;
+  align-items: center; gap: 9px;
+  padding: 7px 0;
+  border-top: 1px solid var(--bd);
+}
+.link-row:first-child { border-top: 0; }
+.link-row-name { font-size: 12px; color: var(--tx); white-space: nowrap; }
+.link-row-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--tx3); }
+.link-row-ev {
+  min-width: 0; font-family: var(--mono); font-size: 11px; color: var(--tx2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.link-row.is-ok .link-row-dot { background: var(--ok); }
+.link-row.is-warn .link-row-dot { background: var(--warn); }
+.link-row.is-err .link-row-dot { background: var(--err); }
+.link-row.is-na .link-row-dot { background: transparent; border: 1px dashed var(--bd2); }
+.link-row.is-warn .link-row-ev { color: var(--warn); }
+.link-row.is-err .link-row-ev { color: var(--err); }
+.link-row.is-na .link-row-ev { color: var(--tx3); }
+
+.link-row-act {
+  background: none; border: 0; padding: 2px 0 2px 4px;
+  font: inherit; font-size: 11px; color: var(--ac);
+  cursor: pointer; white-space: nowrap;
+}
+.link-row-act:hover { text-decoration: underline; }
+.link-row-act:focus-visible { outline: 2px solid var(--ac-line); outline-offset: 2px; border-radius: 3px; }
+
+.link-panel-foot {
+  padding-top: 8px; border-top: 1px solid var(--bd);
+  font-size: 11px; color: var(--tx3);
+}
+.link-panel-empty { font-size: 12px; line-height: 1.6; color: var(--tx2); }
+
+/* ── 窄屏 ─────────────────────────────────────────────────────────────── */
+/* <1100px：顶栏只留「模型 + 用量」，搜索次数让位给链路状态（它更接近"能不能用"）。 */
+@media (max-width: 1100px) {
+  #search-count-label { display: none; }
+}
+@media (max-width: 860px) {
+  #link-status-text { max-width: 150px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .link-panel { animation: none; }
+  .link-caret { transition: none; }
+}
+
+@keyframes linkPanelIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}

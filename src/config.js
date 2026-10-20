@@ -165,12 +165,44 @@ export const DEFAULT_CONFIG = {
   snowluma: {
     dir: '',                   // SnowLuma 程序目录；留空 = 自动探测项目内 ./snowluma
     autoLaunch: false,         // 应用启动时自动拉起 SnowLuma（未运行时）
+    // 协议端形态：'auto'（按 dir/autoLaunch/端口自动判，见 resolveProtocolMode）
+    //             | 'embedded'（本应用管理内置 SnowLuma，可钉死）
+    //             | 'external'（协议端由外部提供，如 NapCat 容器；可钉死）
+    mode: 'auto',
     // 第二实例默认连自己的 OneBot 端口（3001/3000 + 偏移），
     // 否则两个实例会同时连到主实例的 SnowLuma，消息被处理两遍。
     wsUrl: `ws://127.0.0.1:${3001 + portOffset()}`,
     httpUrl: `http://127.0.0.1:${3000 + portOffset()}`,
     accessToken: '',           // WebSocket 令牌
     httpAccessToken: ''        // HTTP API 令牌（SnowLuma 可与 WS 不同；留空沿用 accessToken）
+  },
+  // QQ 扫码登录（控制台「QQ 登录」面板）。实现：src/qq-login.js。
+  // 现场与接口契约见 doc/audit/console-access-plan.md §8/§9/§12.1。
+  qqLogin: {
+    // NapCat WebUI（容器端口映射见 deploy/napcat.container；只发布在回环）
+    webuiUrl: 'http://127.0.0.1:6099',
+    // WebUI 令牌只从文件读（napcat 的 webui.json），配置里存令牌值会被 /api/config 漏出：
+    // 脱敏规则只认键名裸 token，webuiToken 不在其中。
+    webuiTokenFile: '~/napcat/config/webui.json',
+    requestTimeoutMs: 1500,     // 单次 WebUI 调用超时（回环，够用）
+    pollIdleMs: 90000,          // 无人在看时停止轮询的静默期
+    actionCooldownMs: 3000,     // start/refresh 冷却（防连点打崩登录服务）
+    qrTtlMs: 120000,            // 前端倒计时估计值；真实 TTL 以 NapCat 为准
+    qrSvgWidth: 240,
+    statusProbeMs: 1000,        // 面板轮询时对 WebUI 的最小探测间隔
+    credentialTtlMs: 3000000,   // WebUI 凭据缓存（NapCat 侧 1 小时有效）
+    fallbackContainerQrcode: false // 应急分支：WebUI 不可用时读容器内 qrcode.png
+  },
+  // 容器协议端（NapCat quadlet）原生管理。实现：src/protocol-side.js。
+  // 生命周期仍归 systemd（enabled / 开机自启由单元决定）；AIChat **不自动拉起**，
+  // 只在控制台里显示状态并提供手动 start / stop / restart。
+  protocolSide: {
+    enabled: true,             // 关闭后 /api/protocol/* 只读也不做动作（state=unknown + 说明）
+    unit: 'napcat.service',    // 用户级 systemd 单元（rootless quadlet）
+    container: 'napcat',       // 容器名（systemctl 认不到单元时用它兜底识别）
+    engine: 'auto',            // 'auto' | 'podman' | 'docker'（auto = 先 podman 后 docker）
+    actionTimeoutMs: 90000,    // start/stop/restart 上限；stop 要等 StopTimeout=80 的优雅退出
+    statusCacheMs: 2000        // 状态只读缓存：控制台轮询 /api/status 时不重复打 systemctl
   },
   // 人设与行为
   persona: {
@@ -296,6 +328,24 @@ export const DEFAULT_CONFIG = {
       // "高峰窗口外一律 = 低谷"（peakWindowActive 只读 peak.start/end），
       // valley.start/end 是旧版死字段，loadConfig 时剔除。
       valley: { sliderPos: 100 }
+    },
+    // ── 参与策略（选择驱动，2026-10-20）──
+    // 一个字段决定"什么时候开口"，三种模式互斥（避免散落的开关各说各话）：
+    //   probability = 沿用响应滑条（档位 + 随机概率）—— 默认，兼容旧行为
+    //   ai          = 群聊非定向消息交给模型自己判断（正文 [[PASS]] = 这轮不接），见 aiJudge
+    //   directed    = 只在被 @ / 拍一拍 / 关键词命中 / 私聊时响应，无随机
+    participationMode: 'probability',
+    // ── AI 自动判断接话（participationMode='ai' 时生效）──
+    aiJudge: {
+      enabled: false,        // 与 participationMode='ai' 同步（前端切换模式时一起写）
+      passMarker: '[[PASS]]', // 模型只输出这个标记 = 这轮不接（核心在 rescue 之前识别）
+      minGapSec: 0           // 同群两次 AI 判定最小间隔（秒）；0 = 不限制
+    },
+    // ── 出站硬上限（安全保险丝）──
+    // 每**滚动** 1 小时真正发到 QQ 的消息条数上限（文本/图片/语音/提醒/@ 回复都算）。
+    // 0 = 不限。只计成功发送（失败/去重不计），全局共享，闸门在 SendQueue 唯一出口。
+    limits: {
+      maxMessagesPerHour: 2000
     }
   },
   // 屏蔽名单：{ [群号]: [QQ号, ...] }
@@ -383,6 +433,39 @@ export const DEFAULT_CONFIG = {
 };
 
 /** 深合并（含 __replace__ 整体替换约定）。导出供 routes.js 的预览端点做"不落盘的临时合并"。 */
+
+// ── 参与策略 / AI 判定：统一口径的读写辅助 ────────────────────────────────
+// 单一定义点：解析层（prompt.resolveContextTier）、系统提示（buildSystemPrompt）、
+// 核心短路（orchestrator）都从这里取，避免三处各写一遍"什么算 AI 模式"。
+
+export const PARTICIPATION_MODES = ['probability', 'ai', 'directed'];
+
+/** 参与策略白名单：未知/非法值一律回落 probability（旧行为）。 */
+export function normalizeParticipationMode(value) {
+  const mode = String(value ?? '').trim();
+  return PARTICIPATION_MODES.includes(mode) ? mode : 'probability';
+}
+
+/**
+ * 是否处于"AI 自动判断接话"模式。
+ *
+ * 两个来源（保持向后兼容）：
+ *   · participationMode === 'ai'（选择驱动的主口径）
+ *   · aiJudge.enabled === true（旧接口/单独开关，允许只写它）
+ * 前端切换模式时会把两者同步写；后端 sanitize 只做白名单与数值收敛，不强推导。
+ */
+export function isAiJudgeMode(store) {
+  const st = (store && typeof store === 'object') ? store : {};
+  if (normalizeParticipationMode(st.participationMode) === 'ai') return true;
+  return st.aiJudge?.enabled === true;
+}
+
+/** AI 判定用的"不接话"标记（空/非法回落 [[PASS]]，最长 32 字）。 */
+export function aiJudgePassMarker(store) {
+  const raw = String((store && typeof store === 'object' ? store.aiJudge?.passMarker : '') ?? '').trim();
+  return (raw || '[[PASS]]').slice(0, 32);
+}
+
 export function deepMerge(base, override) {
   if (override === null || override === undefined) return structuredClone(base);
   if (typeof base !== 'object' || base === null || Array.isArray(base)) return structuredClone(override);
@@ -402,6 +485,87 @@ export function deepMerge(base, override) {
     }
   }
   return out;
+}
+
+// ── 协议端形态：外部协议端模式的**单一判定点** ──────────────────────────
+//
+// 现场错配（doc/audit/protocol-side-mismatch.md S1/S2/U 组）的根因是同一件事
+// 「协议端到底是谁管的」在 UI、状态、诊断、启停接口里各判一遍，且多数路径默认
+// 「本应用管理内置 SnowLuma」。这里给出唯一判定点：所有消费方（/api/status、
+// 诊断文案、/api/snowluma/* 的 409 闸）都只调用它，不许本地再写一套。
+//
+// 判定只读**配置**，不读运行期健康（端口开没开、WS 连没连）：
+// 形态是"部署方式"，健康是"此刻状态"。把健康混进形态会让 mode 随断线翻转，
+// 诊断文案跟着在两个故事之间跳。健康面见 onebot.dataPathStatus()/httpOk。
+//
+// 自动判定（explicitMode='auto'）：
+//   外部模式 ⇔ dir 为空 ∧ autoLaunch=false ∧ wsUrl/httpUrl 可解析
+//              ∧ httpUrl 端口 ≠ 3000（出厂默认恰好是 Forgejo 的端口）
+//   其余情况：有内置目录 ⇒ embedded；配置自相矛盾/不可解析/仍是出厂默认 ⇒
+//   unconfigured（"协议端未配置"），既不算内置也不算外部，诊断给"去配置端口"。
+// 3000 那条是刻意的：全新部署/配置段丢失时 httpUrl 会漂回 3000，它指向的是
+// Forgejo 而不是 OneBot；这种情况绝不能判成"外部协议端已配好"。
+export const PROTOCOL_MODE = Object.freeze({
+  EMBEDDED: 'embedded',
+  EXTERNAL: 'external',
+  UNCONFIGURED: 'unconfigured'
+});
+
+/** 从 ws:// · http:// · wss:// · https:// 取端口；不可解析返回 0。 */
+function endpointPort(raw) {
+  try {
+    const u = new URL(String(raw || ''));
+    if (u.port) return Number(u.port);
+    return Number(u.protocol === 'https:' || u.protocol === 'wss:' ? 443 : 80);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 判定协议端形态。纯函数、无 I/O —— 测试可直接喂参数覆盖所有分支。
+ * @returns {{mode:'embedded'|'external'|'unconfigured', reason:string, wsPort:number, httpPort:number}}
+ */
+export function resolveProtocolMode({
+  dir = '', autoLaunch = false, wsUrl = '', httpUrl = '', explicitMode = 'auto'
+} = {}) {
+  const wsPort = endpointPort(wsUrl);
+  const httpPort = endpointPort(httpUrl);
+  const ports = { wsPort, httpPort };
+  const explicit = String(explicitMode || 'auto').trim().toLowerCase();
+  if (explicit === PROTOCOL_MODE.EMBEDDED || explicit === PROTOCOL_MODE.EXTERNAL) {
+    return { mode: explicit, reason: `配置显式指定 snowluma.mode=${explicit}`, ...ports };
+  }
+  const dirText = String(dir || '').trim();
+  if (dirText) {
+    return { mode: PROTOCOL_MODE.EMBEDDED, reason: `检测到内置 SnowLuma 目录：${dirText}`, ...ports };
+  }
+  if (autoLaunch === true) {
+    return {
+      mode: PROTOCOL_MODE.UNCONFIGURED,
+      reason: 'snowluma.dir 为空但 autoLaunch=true（配置自相矛盾：没有内置目录可拉起）',
+      ...ports
+    };
+  }
+  if (!wsPort || !httpPort) {
+    return {
+      mode: PROTOCOL_MODE.UNCONFIGURED,
+      reason: `wsUrl/httpUrl 不可解析（ws=${wsUrl || '空'} http=${httpUrl || '空'}），无法判定协议端形态`,
+      ...ports
+    };
+  }
+  if (httpPort === 3000) {
+    return {
+      mode: PROTOCOL_MODE.UNCONFIGURED,
+      reason: 'snowluma.httpUrl 仍是出厂默认端口 3000（该端口现场可能是 Forgejo 等无关服务），请配置为 OneBot HTTP API 端口（如 3002）',
+      ...ports
+    };
+  }
+  return {
+    mode: PROTOCOL_MODE.EXTERNAL,
+    reason: `外部协议端模式：无内置 SnowLuma 目录、未自动拉起，WS 端口 ${wsPort} / HTTP 端口 ${httpPort} 指向外部端点（如 NapCat 容器）`,
+    ...ports
+  };
 }
 
 export function loadConfig() {
@@ -607,6 +771,24 @@ export function updateConfig(patch) {
   // 磁盘上可能已经存过历史遗留的派生标记，一并清掉
   stripDerivedFlags(currentConfig);
   stripObsoleteFields(currentConfig);
+
+  // ── 参与策略 / AI 判定 / 出站硬上限：白名单与数值收敛 ──
+  // 前端只上报选择，非法值不许进入运行态（直接手改接口/旧配置都要落回安全默认）。
+  // 注意：participationMode 与 aiJudge.enabled 的同步由**前端切换模式时**完成
+  // （这里不强推导：允许只写 aiJudge.enabled 的旧接口用法，见 isAiJudgeMode）。
+  const storeNow = currentConfig.store = currentConfig.store || {};
+  storeNow.participationMode = normalizeParticipationMode(storeNow.participationMode);
+  const aiNow = (storeNow.aiJudge && typeof storeNow.aiJudge === 'object') ? storeNow.aiJudge : {};
+  storeNow.aiJudge = {
+    enabled: aiNow.enabled === true,
+    passMarker: (String(aiNow.passMarker ?? '').trim() || '[[PASS]]').slice(0, 32),
+    minGapSec: Math.max(0, Math.min(3600, Math.floor(Number(aiNow.minGapSec) || 0)))
+  };
+  const limitsNow = (storeNow.limits && typeof storeNow.limits === 'object') ? storeNow.limits : {};
+  const capNow = Number(limitsNow.maxMessagesPerHour);
+  storeNow.limits = {
+    maxMessagesPerHour: Number.isFinite(capNow) ? Math.max(0, Math.floor(capNow)) : 2000
+  };
 
   // ── 响应档位：以滑条位置为唯一真相，派生 tier 与随机概率 ──
   // 前端只负责上报滑条位置（contextSliderPos），档位和概率一律由这里换算。

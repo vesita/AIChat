@@ -13,8 +13,12 @@
        官方要求必须动态加载 o.alicdn.com 的 SDK 并直连 aliyuncs 验签域，
        故 script-src / connect-src / frame-src / worker-src 增列对应来源，
        其余仍锁死在 'self'。 -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-AusRctWgAU9T2N4jaRWpaSsObfjDZwj+sO1AcdUK5/s=' https://o.alicdn.com https://kondius.cn; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; media-src 'self' data: blob:; connect-src 'self' https://kondius.cn https://*.aliyuncs.com https://*.alicdn.com; frame-src https://*.aliyuncs.com https://*.alicdn.com https://kondius.cn; worker-src 'self' blob: https://*.alicdn.com https://kondius.cn; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'" />
-  <link rel="stylesheet" href="/style.css" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-HJ5DwBIuT8nMl6SGSb24X9oSvsfDcsGPIkCgmk97V7I=' https://o.alicdn.com https://kondius.cn; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; media-src 'self' data: blob:; connect-src 'self' https://kondius.cn https://*.aliyuncs.com https://*.alicdn.com; frame-src https://*.aliyuncs.com https://*.alicdn.com https://kondius.cn; worker-src 'self' blob: https://*.alicdn.com https://kondius.cn; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'" />
+  <link rel="stylesheet" href="./style.css" />
+  <!-- 顶栏链路状态带 / 诊断面板的组件样式：单独成文件，避免与公共 style.css 的改动互相踩 -->
+  <link rel="stylesheet" href="./shell.css" />
+  <!-- 设置页搜索 / 深链定位的组件样式（同样单独成文件，不动 style.css） -->
+  <link rel="stylesheet" href="./settings.css" />
   <script>
     /* 主题预置：在样式生效前就定好 data-theme，避免首屏闪白/闪黑。
        只认 dark / light，非法值回退暗色。
@@ -36,9 +40,6 @@
     <div class="top-status">
       <!-- 状态胶囊带：窄窗口下横向滚动（不折行、不裁切）；右侧控件固定可见 -->
       <div class="top-chips">
-        <span id="onebot-dot" class="dot dot-off" title="OneBot 连接状态"></span>
-        <span id="onebot-label" class="muted">OneBot 未连接</span>
-        <span class="sep"></span>
         <span id="model-label" class="muted">模型：-</span>
         <span class="sep"></span>
         <span id="usage-label" class="muted">今日：-</span>
@@ -46,8 +47,21 @@
         <span id="search-count-label" class="muted" title="今日联网搜索次数（web_search / web_fetch）">搜索：-</span>
       </div>
       <span class="sep"></span>
-      <!-- 就绪进度指示器：4 圆点 = QQ运行 / SnowLuma运行 / OneBot连接 / 配置完成 -->
-      <span id="readiness-dots" class="readiness-dots" title="就绪进度：点击跳转到对应设置">
+      <!-- 链路状态：顶栏里**唯一**的连接状态判定（ui/app/01-boot.js → computeLinkState）。
+           改造前这里是「OneBot 圆点 + 4 个就绪圆点 + 一串胶囊」各自判定、语义重叠；
+           首屏文案还写死了「OneBot 未连接」——请求没跑到或失败时那句话永远留在页面上，
+           用户看到的就是"总显示连不上"。现在首屏只给中性的「检测中」，拿到 /api/status
+           并判定为断连才显示中断。点开是五段链路诊断。 -->
+      <button id="link-status-btn" class="link-status" type="button"
+              title="点击查看链路诊断" aria-expanded="false" aria-controls="link-status-panel">
+        <span id="link-status-dot" class="link-dot is-wait" aria-hidden="true"></span>
+        <span id="link-status-text">链路状态检测中…</span>
+        <span class="link-caret" aria-hidden="true">▾</span>
+      </button>
+      <!-- 就绪圆点已由上面的链路状态按钮取代（视觉冗余 + 各判各的）。
+           保留为**隐藏兼容锚点**：test/qq-login-ui-test.mjs 的外部协议端回归直接断言
+           这 4 个 .rdot 的 className / title —— 删掉会让那条回归失去判据。 -->
+      <span id="readiness-dots" class="readiness-dots" hidden aria-hidden="true" title="就绪进度">
         <span class="rdot" data-target="snowluma" title="QQ 内核未运行"></span>
         <span class="rdot" data-target="snowluma" title="SnowLuma 未运行"></span>
         <span class="rdot" data-target="snowluma" title="OneBot 未连接"></span>
@@ -55,6 +69,18 @@
       </span>
       <button id="theme-btn" class="icon-btn" title="切换主题（暗 ↔ 亮）" aria-label="切换主题"></button>
       <button id="pause-btn" class="btn btn-small">暂停</button>
+      <!-- QQ 未登录时的自助扫码入口：refreshStatus() 只在 onebot.connected 时隐藏它 -->
+      <button id="qq-login-chip" class="nav-btn hidden" title="QQ 未登录：点此扫码登录">QQ 登录</button>
+      <!-- 五段链路诊断面板：默认隐藏；内容由 01-boot.js 的 renderLinkPanel() 按最近一次
+           /api/status 渲染（只在点击打开时渲染，不额外发请求）。 -->
+      <div id="link-status-panel" class="link-panel" role="region" aria-label="链路诊断" hidden>
+        <div class="link-panel-head">
+          <strong>链路诊断</strong>
+          <span class="link-panel-hint">断在哪一段，下一手就修哪一段</span>
+        </div>
+        <div id="link-panel-body" class="link-rows"></div>
+        <div class="link-panel-foot">证据来自 /api/status · 每 15 秒自动刷新</div>
+      </div>
     </div>
   </header>
 
@@ -63,7 +89,7 @@
   <div id="loading-overlay" class="loading-overlay">
     <div class="loading-card">
       <div class="loading-title">QQ Agent 正在启动</div>
-      <div class="loading-sub" id="loading-status">正在启动 SnowLuma 与 OneBot 服务，请稍候…</div>
+      <div class="loading-sub" id="loading-status">正在启动服务并检查协议端，请稍候…</div>
       <div class="loading-spinner"></div>
       <pre class="loading-logs" id="loading-logs"></pre>
     </div>
@@ -156,22 +182,24 @@
     </section>
   </main>
 
-  <!-- M9 拆分：ESM 桥（vendor 模块 → window）先执行；其后 12 段普通脚本按 defer 顺序执行，
+  <!-- M9 拆分：ESM 桥（vendor 模块 → window）先执行；其后 13 段普通脚本按 defer 顺序执行，
        module 与 defer 共享同一条按文档顺序的延迟队列，保证桥先于 00-core.js。 -->
-  <script type="module" src="/app.js"></script>
-  <script defer src="/app/00-core.js"></script>
-  <script defer src="/app/01-boot.js"></script>
-  <script defer src="/app/02-sse-sessions.js"></script>
-  <script defer src="/app/03-snowluma.js"></script>
-  <script defer src="/app/04-archive-usage.js"></script>
-  <script defer src="/app/05-memory-settings.js"></script>
-  <script defer src="/app/06-settings-render.js"></script>
-  <script defer src="/app/07-settings-events.js"></script>
-  <script defer src="/app/08-modals.js"></script>
-  <script defer src="/app/09-community.js"></script>
-  <script defer src="/app/10-feedback.js"></script>
-  <script defer src="/app/12-concept2-ui.js"></script>
-  <script defer src="/app/11-init.js"></script>
+  <script type="module" src="./app.js"></script>
+  <script defer src="./app/00-core.js"></script>
+  <script defer src="./app/01-boot.js"></script>
+  <script defer src="./app/02-sse-sessions.js"></script>
+  <script defer src="./app/03-snowluma.js"></script>
+  <script defer src="./app/04-archive-usage.js"></script>
+  <script defer src="./app/05-memory-settings.js"></script>
+  <script defer src="./app/06-settings-render.js"></script>
+  <script defer src="./app/07-settings-events.js"></script>
+  <script defer src="./app/08-modals.js"></script>
+  <script defer src="./app/09-community.js"></script>
+  <script defer src="./app/10-feedback.js"></script>
+  <script defer src="./app/12-concept2-ui.js"></script>
+  <!-- 扫码登录面板：必须在 11-init（启动入口会调用 openQQLoginPanel/openTokenPrompt）之前 -->
+  <script defer src="./app/13-qq-login.js"></script>
+  <script defer src="./app/11-init.js"></script>
 
   <!-- 阿里云验证码 2.0（意见收集/金句上传共用）：容器常驻；AliyunCaptchaConfig 与
        SDK 动态加载都在 10-feedback.js 内（CSP 不放行无 hash 内联脚本）。 -->

@@ -1,0 +1,24 @@
+{
+  "id": "token-saver",
+  "name": "上下文省流",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "utility",
+  "description": "把最旧的已读历史裁到 keepLast / 字符预算内（before-llm-messages），并在“本轮只发了消息、没有待执行工具”时提前收尾（reply.local-policy），省掉只为收尾的整轮调用。纯本地，不改工具消息。",
+  "enabledByDefault": true,
+  "capabilities": ["reply.local-policy", "llm.usage"],
+  "settings": {
+    "enabled": true,
+    "keepLast": 40,
+    "charBudget": 12000,
+    "localPolicy": false,
+    "countUsage": true
+  },
+  "configSchema": {
+    "enabled": { "type": "boolean", "label": "启用上下文省流", "description": "关闭后本插件不做任何裁剪、不参与收尾判定（行为与没装一致）。" },
+    "keepLast": { "type": "number", "label": "保留已读条数", "description": "【已读信息】最多保留最近多少条，更旧的裁掉（默认 40）。" },
+    "charBudget": { "type": "number", "label": "已读字符预算", "description": "【已读信息】正文的字符上限，超出时从最旧的开始裁（默认 12000，0 = 不按字符裁）。" },
+    "localPolicy": { "type": "boolean", "label": "允许本地收尾", "description": "开启后，纯发送且无待执行工具的一轮会提前结束（默认关闭：默认策略保守，不改变对话轮次）。" },
+    "countUsage": { "type": "boolean", "label": "统计省下的条数", "description": "通过 llm.usage 把本轮裁掉的历史条数记进会话附加用量（默认开启）。" }
+  }
+}

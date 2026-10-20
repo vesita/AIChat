@@ -8,7 +8,7 @@
 //
 // 同一会话（群/私聊）同时最多一个运行；运行期间新消息只写 JSON（未读），不叠加触发。
 // 不同会话之间并行，受 maxConcurrentRuns 全局限流。
-import { getConfig, storeConfigForChat, personaForChat } from './config.js';
+import { getConfig, storeConfigForChat, personaForChat, isAiJudgeMode, aiJudgePassMarker } from './config.js';
 import { vendorOfConfig } from './model-prices.js';
 import { randInt } from './util.js';
 import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from './prompt.js';
@@ -19,6 +19,39 @@ import { currentProviders } from './providers.js';
 import { skillManager } from './skills/manager.js';
 import { getToolAvailability } from './tool-registry.js';
 import { rescueUnsentReply } from './reply-rescue.js';
+
+/**
+ * 触发判定扩展点（reply.interest-judge）的单次咨询超时。
+ *
+ * 判定发生在 ingest / wake 的关键路径上：慢插件不能拖住消息入库（ingest 是
+ * 串行热路径，每条消息都要过判定）或唤醒。超时与抛错一律回退核心自己的判定，
+ * 所以 300ms 是"最多多等这么久"，不是"必须等满"。
+ */
+const WAKE_JUDGE_TIMEOUT_MS = 300;
+/** 超时哨兵：与插件合法返回（对象）区分开。 */
+const WAKE_JUDGE_TIMEOUT = Symbol('wake-judge-timeout');
+
+// ── 可靠性修复（M-1 / M-2 / T-1）与负向对照开关 ──────────────────────────
+// 负向对照开关只给测试用：COREFIX_M1=0 / COREFIX_M2=0 关掉对应修复，
+// 用来证明回归测试"修前会失败"。生产环境不设这些变量 → 修复恒开。
+const FIX_BATCH_RECOVERY = process.env.COREFIX_M1 !== '0';
+const FIX_DIRECTED_ZERO_SEND_ALERT = process.env.COREFIX_M2 !== '0';
+/** 定向触发原因（与 prompt.js / #judgeEligible 同一份口径）。 */
+const DIRECTED_REASONS = new Set(['被艾特', '拍了拍我', '私聊消息']);
+/** 可靠性计数的滚动窗口：24 小时（/api/status 里展示的是"近 24h 发生次数"）。 */
+const RELIABILITY_WINDOW_MS = 24 * 3600 * 1000;
+
+/** 工具执行超时（T-1）：同一个挂住的工具不值得用会话级重试连打几次超时预算。 */
+class ToolTimeoutError extends Error {
+  constructor(toolName, timeoutMs, sessionId) {
+    super(`工具执行超时：${toolName} 在 ${timeoutMs}ms 内未返回`);
+    this.name = 'ToolTimeoutError';
+    this.code = 'TOOL_TIMEOUT';
+    this.toolName = toolName;
+    this.timeoutMs = timeoutMs;
+    this.sessionId = sessionId;
+  }
+}
 
 export class Orchestrator {
   constructor({ store, memory, stickers, sender, sessions, onebot, emit = null, reminders = null, videoReader = null }) {
@@ -58,6 +91,10 @@ export class Orchestrator {
     // 自判"是否仍在话题上"，偏离/结束则 finish("话题结束") 退出活跃期。
     // 到期自动退出兜底（LLM 忘了判断也不会永远活跃）。
     this.activeTopics = new Map();
+    // ── AI 自动判断接话（participationMode='ai'）──
+    // chatKey -> 上一次发起 AI 判定的时间戳。minGapSec>0 时用它做节流：
+    // 风暴期里不是每句都值得调模型；间隔内的消息留在未读，等下一次触发一起判。
+    this.aiJudgeLastAt = new Map();
     // ── 提示词锚点（前缀缓存深化，2026-09-25）──
     // chatKey -> { readIds, readCount, memberIds }：上一轮发给模型的
     // 【记忆】+【已读信息】前缀状态。下一轮 buildUserPrompt 据此判断能否
@@ -70,6 +107,16 @@ export class Orchestrator {
     this.aborted = false;
     this.reminderTimer = null;         // 提醒调度定时器
     this.reminderFiring = new Set();   // 防止同一提醒并发触发
+    // ── 可靠性计数（24h 滚动，statusSummary/GET /api/status 可观测）──
+    // M-2：定向触发、正常收尾但一条都没发（静默漏回）
+    this.missedDirectedTimes = [];
+    // M-1：定向触发、运行失败且一条都没发（已回滚未读，进入自动重试/等人处理）
+    this.unansweredDirectedTimes = [];
+    // T-1：工具执行超时次数
+    this.toolTimeoutTimes = [];
+    // chatKey -> { count }：触发批失败且未发出任何消息后的自动重试计数。
+    // 有次数上限（默认 2），用尽后不再回滚未读（否则会变成无限重试循环）。
+    this.failedBatchRetries = new Map();
   }
 
   /**
@@ -145,6 +192,115 @@ export class Orchestrator {
     return { ok: true, restored };
   }
 
+  // ── 可靠性：失败批回补 / 定向零发送观测 / 工具超时计数 ───────────────────
+
+  /**
+   * 记一次可靠性事件（24h 滚动计数 + 固定格式日志 + SSE 事件）。
+   *
+   * 为什么集中在这里：M-1/M-2/T-1 都要"不能静默"——事件必须同时出现在日志、
+   * /api/status 与 UI 事件流里，否则排障时只能翻远端日志。
+   */
+  #recordReliability(kind, message, payload = {}) {
+    const now = Date.now();
+    const list = kind === 'missedDirected' ? this.missedDirectedTimes
+      : kind === 'unansweredDirected' ? this.unansweredDirectedTimes
+        : this.toolTimeoutTimes;
+    list.push(now);
+    while (list.length && now - list[0] > RELIABILITY_WINDOW_MS) list.shift();
+    // 工具超时是错误级；其余是告警级（正常运行也可能出现，重点在可观测）。
+    if (kind === 'toolTimeout') console.error(message);
+    else console.warn(message);
+    this.emit('reliability-alert', { kind, at: now, message, ...payload });
+  }
+
+  /** 读取 24h 滚动计数（顺带清理过期时间戳）。 */
+  #rollingCount(list) {
+    const now = Date.now();
+    while (list.length && now - list[0] > RELIABILITY_WINDOW_MS) list.shift();
+    return list.length;
+  }
+
+  /**
+   * 这条触发批是否"定向"（私聊 / 被艾特 / 拍一拍）。
+   *
+   * 口径来自 prompt.js 的"必回"定义：定向触发是硬语义，零发送必须告警；
+   * 群里的随机/关键词接话属于"可以不接"，不能误报。
+   */
+  #isDirectedBatch(chatKey, triggerEntries = [], contextReason = '') {
+    if (String(chatKey).startsWith('private:')) return true;
+    if (DIRECTED_REASONS.has(String(contextReason || ''))) return true;
+    return (Array.isArray(triggerEntries) ? triggerEntries : [])
+      .some((m) => m?.atMe === true || m?.isPoke === true);
+  }
+
+  /**
+   * M-2：定向触发、正常收尾但一条消息都没发 → 告警 + 24h 计数。
+   *
+   * 线上实测 183 条会话里有 4 条这种"必回却没回"；旧实现只看 sent.length，
+   * 于是 status=noreply 被当成正常，日志与状态面都没有任何痕迹。
+   */
+  #alertDirectedZeroSend({ chatKey, session, triggerEntries, contextReason, status }) {
+    if (!FIX_DIRECTED_ZERO_SEND_ALERT) return;
+    if (status !== 'noreply') return;                        // error 走 M-1，aborted 是用户选择
+    if ((session.sent || []).length > 0) return;
+    if (!this.#isDirectedBatch(chatKey, triggerEntries, contextReason)) return;
+    session.missedDirected = true;
+    this.#recordReliability('missedDirected',
+      `[reliability] 定向零发送：${chatKey} 会话 ${session.id}（触发：${contextReason || '定向'}）一条消息都没发出（status=noreply）`,
+      { chatKey, sessionId: session.id });
+  }
+
+  /**
+   * M-1：触发批运行失败且一条消息都没发出 → 回滚未读 + 退避自动重试。
+   *
+   * 根因：触发批在运行前就被 drainUnread 置了已读，失败收尾只把会话标成 error。
+   * 于是这批消息永久处于"已读、无回复"状态（线上实测：503 风暴后 @ 消息没人回）。
+   *
+   * 做法：按触发批的时间窗把未读翻回来（store.markUnreadInWindow 是现成能力），
+   * 再排一次带退避的唤醒 —— 下一次 wake 会重新 drain 同一批消息并重跑。
+   * 每个 chatKey 最多自动重试 cfg.reliability.batchRetries 次（默认 2），用尽后
+   * 不再回滚（避免无限重试循环），只留用户可用的手动重试与状态面计数。
+   *
+   * 已发出过消息的失败**不**回滚：重复发言比漏回更糟（与 retrySession 的守卫同口径）。
+   */
+  #recoverFailedBatch({ chatKey, session, triggerEntries, error }) {
+    if (!FIX_BATCH_RECOVERY) return;
+    if (this.aborted || this.paused) return;
+    if ((session.sent || []).length > 0) return;
+    const batch = Array.isArray(triggerEntries) ? triggerEntries : [];
+    if (!batch.length) return;
+    const directed = this.#isDirectedBatch(chatKey, batch, session.contextReason);
+    // 观测：定向且失败未发 = 用户视角的"被艾特了没人理"，单独计数（先于重试次数判断）。
+    if (directed) {
+      this.#recordReliability('unansweredDirected',
+        `[reliability] 定向触发运行失败且未发出任何消息：${chatKey} 会话 ${session.id}（${error?.message ?? error}）`,
+        { chatKey, sessionId: session.id });
+    }
+    const cfg = getConfig().reliability || {};
+    const maxRetries = Math.max(0, Number.isFinite(Number(cfg.batchRetries)) ? Number(cfg.batchRetries) : 2);
+    const state = this.failedBatchRetries.get(chatKey) || { count: 0 };
+    state.count += 1;
+    this.failedBatchRetries.set(chatKey, state);
+    if (state.count > maxRetries) {
+      console.error(`[reliability] ${chatKey} 触发批失败后自动重试已用尽（${maxRetries} 次）：不再回滚未读，会话 ${session.id} 可在会话页手动重试`);
+      return;
+    }
+    const tsList = batch.map((m) => Number(m?.ts) || 0).filter((n) => n > 0);
+    const startedAt = tsList.length ? Math.min(...tsList) : (Number(session.startedAt) || Date.now());
+    const endedAt = tsList.length ? Math.max(...tsList) : (Number(session.endedAt) || Date.now());
+    const restored = this.store.markUnreadInWindow(chatKey, startedAt, endedAt);
+    if (!restored) {
+      console.error(`[reliability] ${chatKey} 触发批回滚没有恢复任何未读（时间窗 ${startedAt}~${endedAt}），无法自动重试`);
+      return;
+    }
+    const base = Math.max(0, Number(cfg.batchRetryBaseMs) || 5000);
+    const delay = base * Math.pow(2, state.count - 1);
+    console.warn(`[reliability] ${chatKey} 触发批失败且一条未发（${error?.message ?? error}）：已回滚 ${restored} 条未读，${delay}ms 后自动重试（第 ${state.count}/${maxRetries} 次）`);
+    this.emit('chat-update', chatKey);
+    // 与 drain 的 scheduleWake 同一个 set 去重：这里先排，wake 末尾的 drain 不会叠加。
+    this.scheduleWake(chatKey, delay);
+  }
+
   // ── 入站接口 ───────────────────────────────────────────────────────────
 
   /**
@@ -176,34 +332,257 @@ export class Orchestrator {
     if (!String(cfg.api.model || '').trim()) return;
     // 活跃期内的群：必响应，视作触发（与旧版"跳过判定"语义一致）
     const active = this.#activeState(chatKey);
-    if (!active) {
-      const tierResult = resolveContextTier({
-        triggerEntries: entry ? [entry] : (this.store.peekUnread(chatKey, 1) || []),
-        selfNickname: cfg.persona?.selfNickname || this.onebot.selfNickname || '',
-        botName: cfg.persona?.botName || '',
-        selfId: cfg.onebot?.selfId || this.onebot.selfId || '',
-        cfg: storeConfigForChat(chatKey),
-        isPrivate: String(chatKey).startsWith('private:'),
-        // 单条判定当场掷骰、当场出结果 —— 没有"预判/实跑"两阶段了，
-        // 骰子结果由 resolveContextTier 的 reason 带回（含当时的值）。
-        roll: null
-      });
-      if (!tierResult.shouldRespond) {
-        // 不触发：这条消息立即标已读（只标这一条，不动窗口外已积压的未读——
-        // 那些是上一批遗留，由兜底定时器/下一次触发处理）。
-        if (entry) {
-          this.store.markEntryRead(chatKey, entry.id);
-        } else {
-          this.store.markAllRead(chatKey);
-        }
-        this.emit('chat-update', chatKey);
-        return;
-      }
+    if (active) {
+      // 触发：进入固定的"等待中"倒计时（不重置）。verified 标记让 wake 知道
+      // 这一批是"逐条判定出过触发消息"的，批边界可以信任等待会话的起点。
+      this.scheduleWake(chatKey, null, { verified: true });
+      return;
     }
 
-    // 触发：进入固定的"等待中"倒计时（不重置）。verified 标记让 wake 知道
-    // 这一批是"逐条判定出过触发消息"的，批边界可以信任等待会话的起点。
-    this.scheduleWake(chatKey, null, { verified: true });
+    const base = resolveContextTier({
+      triggerEntries: entry ? [entry] : (this.store.peekUnread(chatKey, 1) || []),
+      selfNickname: cfg.persona?.selfNickname || this.onebot.selfNickname || '',
+      botName: cfg.persona?.botName || '',
+      selfId: cfg.onebot?.selfId || this.onebot.selfId || '',
+      cfg: storeConfigForChat(chatKey),
+      isPrivate: String(chatKey).startsWith('private:'),
+      // 单条判定当场掷骰、当场出结果 —— 没有"预判/实跑"两阶段了，
+      // 骰子结果由 resolveContextTier 的 reason 带回（含当时的值）。
+      roll: null
+    });
+    const info = this.#wakeJudgeInfo({
+      chatKey,
+      base,
+      triggerEntries: entry ? [entry] : (this.store.peekUnread(chatKey, 1) || []),
+      proactive: false
+    });
+    // 没有可咨询的插件 / 本来就不该咨询（私聊、被艾特、拍了拍我）：
+    // 完全同步地走原路径 —— 行为与时序（未读"一闪即已读"）都与没有扩展点时一致。
+    if (!this.#capFirst('reply.interest-judge', {}) || !this.#judgeEligible(base, info)) {
+      this.#applyIncomingDecision(chatKey, entry, base);
+      return;
+    }
+    // 有插件：异步咨询（≤300ms，超时/非法返回/抛错一律回退 base），出结果后再落闸门。
+    this.#applyIncomingDecisionAsync(chatKey, entry, base, info).catch((error) => {
+      console.error(`[orchestrator] ${chatKey} 触发判定插件异常，已按核心判定处理:`, error);
+    });
+  }
+
+  // ── 触发判定扩展点（reply.interest-judge）───────────────────────────────
+  //
+  // 三个判定点统一走 #refineWakeDecision：onIncoming（逐条触发判定）、
+  // wake 里的机械批补判定、wake 的最终档位判定。规则见 #refineWakeDecision。
+  //
+  // 为什么是一个 helper 而不是三处各写一遍：三处的失败语义（无提供者/非法返回/
+  // 抛错/超时）必须一致 —— 任何一处漏了 fail-open，就会出现"装了个坏插件，
+  // 消息全部不响应"这种最难排查的故障。
+
+  /** 落闸门：触发 → 排定唤醒；不触发 → 标已读（只标这一条）。 */
+  #applyIncomingDecision(chatKey, entry, decision) {
+    if (decision?.shouldRespond) {
+      // AI 判定节流：minGapSec 内不重复发起判定。消息保持未读（不标已读），
+      // 等间隔过去后的下一次触发把积压一起判 —— 既止住消息风暴里的模型调用，
+      // 又不丢消息（它们仍会进下一次的【未读信息】）。
+      if (decision.reason === 'AI 判定' && this.#aiJudgeGapBlocked(chatKey)) return;
+      this.scheduleWake(chatKey, null, { verified: true });
+      return;
+    }
+    // 不触发：这条消息立即标已读（只标这一条，不动窗口外已积压的未读——
+    // 那些是上一批遗留，由兜底定时器/下一次触发处理）。
+    if (entry) {
+      this.store.markEntryRead(chatKey, entry.id);
+    } else {
+      this.store.markAllRead(chatKey);
+    }
+    this.emit('chat-update', chatKey);
+  }
+
+  /** 异步判定版落闸门：咨询插件后再落闸门（咨询期间现场可能已变，重新过闸门）。 */
+  async #applyIncomingDecisionAsync(chatKey, entry, base, info) {
+    const decision = await this.#refineWakeDecision(base, info);
+    if (this.paused || this.aborted) return;
+    // 咨询期间可能已经排定了唤醒（后续消息走了同步/更快的判定）——
+    // 与同步路径同语义：倒计时中不再逐条判定，交给聚批。
+    if (this.runningChats.has(chatKey) || this.pendingWake.has(chatKey)) return;
+    this.#applyIncomingDecision(chatKey, entry, decision);
+  }
+
+  /**
+   * AI 判定节流：同群两次判定之间至少间隔 minGapSec。
+   * @returns {boolean} true = 还在间隔内，这次不发起判定（消息保持未读）
+   */
+  #aiJudgeGapBlocked(chatKey) {
+    const sec = Math.max(0, Math.min(3600, Number(getConfig().store?.aiJudge?.minGapSec) || 0));
+    if (sec <= 0) return false;
+    const now = Date.now();
+    const last = this.aiJudgeLastAt.get(chatKey) || 0;
+    if (last && now - last < sec * 1000) {
+      console.log(`[orchestrator] ${chatKey} AI 判定节流中（距上次 ${Math.round((now - last) / 1000)}s < ${sec}s），消息留未读等下次`);
+      return true;
+    }
+    this.aiJudgeLastAt.set(chatKey, now);
+    return false;
+  }
+
+  /**
+   * AI 自动判断接话：识别本轮正文里的约定标记（PASS = 这轮不接）。
+   *
+   * ⚠️ 必须**先于** rescueUnsentReply 调用：模型把要说的话写在正文里时，回复
+   * 安全网会把它抢救成 send_message；PASS 标记若先被 rescue 看到，就会变成一条
+   * 真的发进群的消息（内容还是 "[[PASS]]"）。
+   *
+   * 判定规则（契约）：
+   *   · 非 AI 模式 → 原样放行（行为与没有这个功能时逐字节一致）；
+   *   · 正文 trim == marker（或只剩 marker 行）→ 不接（pass）；
+   *   · 正文为空 且 本次运行没有成功发送 → 不接（pass）；
+   *   · 正文含 marker + 其它内容 → 剥掉 marker 后按正常正文处理；
+   *   · 定向批（被艾特/拍了拍我/私聊）→ **不接受 PASS**（"必回"是硬语义），
+   *     但 marker 仍然剥掉，绝不把标记本身当正文发出去。
+   */
+  #aiJudgeRoundVerdict({ rawContent, session }) {
+    const store = getConfig().store || {};
+    if (!isAiJudgeMode(store)) return { pass: false, text: rawContent, why: '' };
+    const marker = aiJudgePassMarker(store);
+    const text = String(rawContent ?? '');
+    const trimmed = text.trim();
+    const directed = ['被艾特', '拍了拍我', '私聊消息'].includes(String(session?.contextReason || ''));
+
+    if (!trimmed) {
+      // 空正文：本轮没有发过任何消息才算"不接"；已经发过就不改动正常收尾。
+      if (!directed && !(session?.sent?.length)) return { pass: true, text: '', why: '空正文且未发送' };
+      return { pass: false, text, why: '' };
+    }
+    // 去掉"整行只有 marker"的行，再清掉残留的 marker 子串
+    let rest = text.split('\n').filter((line) => line.trim() !== marker).join('\n');
+    if (rest.includes(marker)) rest = rest.split(marker).join('');
+    rest = rest.trim();
+    if (!rest) {
+      if (directed) return { pass: false, text: '', why: '' };   // 定向必回：不接受 PASS
+      return { pass: true, text: '', why: '正文只有 PASS 标记' };
+    }
+    return { pass: false, text: rest === trimmed ? text : rest, why: '' };
+  }
+
+  /**
+   * 这次判定该不该咨询插件。
+   *
+   * 私聊 / 被艾特 / 拍了拍我 = 核心已确定"这是直接召唤"，不是"要不要接话"的
+   * 判断题：插件最多能把它降级成"不响应"，那等于让插件吃掉召唤，绝不允许。
+   */
+  #judgeEligible(base, info) {
+    if (info?.kind === 'private') return false;
+    // AI 自动判断模式：要不要接话已经交给模型自己判断了，本地启发式插件不再插嘴
+    //（两套判定同时生效会互相打架：smart-wake 否决 vs 模型 PASS，口径不可解释）。
+    if (isAiJudgeMode(getConfig().store)) return false;
+    const reason = String(base?.reason || '');
+    return reason !== '私聊消息' && reason !== '被艾特' && reason !== '拍了拍我';
+  }
+
+  /** 组装修正判定插件要的现场信息（契约见 doc/extend_development/skill-reference.md）。 */
+  #wakeJudgeInfo({ chatKey, base, triggerEntries = [], proactive = false, sessionId = null, chatName = '' } = {}) {
+    const cfg = getConfig();
+    const [kind, chatId] = String(chatKey).split(':');
+    return {
+      base: {
+        tier: Number(base?.tier) || 0,
+        reason: String(base?.reason || ''),
+        shouldRespond: base?.shouldRespond === true,
+        count: Math.max(0, Number(base?.count) || 0)
+      },
+      chatKey,
+      kind,
+      chatId,
+      chatName: chatName || this.chatNameCache.get(chatId) || '',
+      model: cfg.api?.model || '',
+      provider: cfg.api?.provider || '',
+      visionEnabled: cfg.api?.vision !== false && modelImageVerdict(cfg.api?.provider, cfg.api?.model) !== 'no-vision',
+      searchEnabled: cfg.webSearch?.enabled !== false,
+      proactive: proactive === true,
+      sessionId: sessionId || null,
+      triggerEntries: (triggerEntries || []).slice(0, 30),
+      recent: this.#recentForJudge(chatKey),
+      botName: cfg.persona?.botName || '',
+      selfNickname: cfg.persona?.selfNickname || this.onebot?.selfNickname || ''
+    };
+  }
+
+  /** 最近消息（给判定插件看上下文；只读快照，不含触发批里的未读也行）。 */
+  #recentForJudge(chatKey) {
+    try {
+      return this.store.recent(chatKey, { limit: 30 }).map((m) => ({
+        text: String(m.text ?? ''),
+        ts: Number(m.ts) || 0,
+        senderId: String(m.senderId ?? ''),
+        senderName: String(m.senderName ?? ''),
+        atMe: m.atMe === true,
+        isPoke: m.isPoke === true,
+        isSelf: m.self === true
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 触发判定扩展点：把核心的同步判定交给 `reply.interest-judge` 插件复核。
+   *
+   * 契约（详见 doc/extend_development/skill-reference.md）：
+   *   · 入参 { base, chatKey, kind, chatId, chatName, model, provider,
+   *           visionEnabled, searchEnabled, proactive, sessionId,
+   *           triggerEntries, recent, botName, selfNickname }
+   *   · 返回 { respond: boolean, reason?: string }
+   *
+   * 规则：
+   *   ① 私聊、被艾特、拍了拍我 → 不咨询（核心直接召唤，插件不能吃掉）；
+   *   ② 无提供者 / 返回非法 / 抛错 / 超时（>300ms）→ 原样返回 base
+   *      （fail-open：装了个坏插件 = 没装，行为与没有扩展点时完全一致）；
+   *   ③ 允许双向覆盖：base=false → 接话；base=true → 不接。核心只信 respond 布尔，
+   *      reason 仅用于解释（写进会话的 contextReason）；
+   *   ④ base 为"未触发"（count=0）却被插件改成接话时，把 count 补成常规已读条数
+   *      —— 否则接话的会话会读到 0 条历史，接话质量无从谈起。
+   */
+  async #refineWakeDecision(base, info) {
+    const b = {
+      tier: Number.isFinite(Number(base?.tier)) ? Number(base.tier) : 0,
+      reason: String(base?.reason || ''),
+      shouldRespond: base?.shouldRespond === true,
+      count: Math.max(0, Number(base?.count) || 0)
+    };
+    if (!this.#judgeEligible(b, info)) return b;
+    const fn = this.#capFirst('reply.interest-judge', {});
+    if (!fn) return b;
+
+    let timer = null;
+    let result;
+    try {
+      result = await Promise.race([
+        Promise.resolve().then(() => fn({ ...info, base: b })),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(WAKE_JUDGE_TIMEOUT), WAKE_JUDGE_TIMEOUT_MS);
+          timer.unref?.();
+        })
+      ]);
+    } catch (error) {
+      // 抛错 = 插件坏了：回退核心判定，只记一条错误供 UI 排障。
+      skillManager.recordError('reply.interest-judge', error);
+      return b;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (result === WAKE_JUDGE_TIMEOUT) {
+      skillManager.recordError('reply.interest-judge', `判定超时（>${WAKE_JUDGE_TIMEOUT_MS}ms），已回退核心判定`);
+      return b;
+    }
+    // 返回非法（undefined / 非对象 / respond 不是布尔）→ 回退 base。
+    if (!result || typeof result !== 'object' || typeof result.respond !== 'boolean') return b;
+    const out = { ...b, shouldRespond: result.respond };
+    const reason = typeof result.reason === 'string' ? result.reason.trim() : '';
+    if (reason) out.reason = reason.slice(0, 120);
+    // base 是"未触发"（count=0）却接话：补上常规已读条数（见规则 ④）。
+    if (out.shouldRespond && out.count <= 0) {
+      out.count = Math.max(1, Number(storeConfigForChat(info?.chatKey).historyCount) || 80);
+    }
+    return out;
   }
 
   /**
@@ -439,9 +818,10 @@ export class Orchestrator {
         }
         hasTrigger = true;   // onIncoming 判定过"触发"，批内必然有触发消息
       } else if (!active) {
-        // 补判定：对每条未读单独跑 resolveContextTier（与 onIncoming 同口径）
+        // 补判定：对每条未读单独跑 resolveContextTier（与 onIncoming 同口径），
+        // 再走触发判定扩展点复核（无提供者/插件异常时 = 原判定）。
         for (const m of probe) {
-          const r = resolveContextTier({
+          const base = resolveContextTier({
             triggerEntries: [m],
             selfNickname: cfgForJudge.persona?.selfNickname || this.onebot.selfNickname || '',
             botName: cfgForJudge.persona?.botName || '',
@@ -450,6 +830,9 @@ export class Orchestrator {
             isPrivate: String(chatKey).startsWith('private:'),
             roll: null
           });
+          const r = await this.#refineWakeDecision(base, this.#wakeJudgeInfo({
+            chatKey, base, triggerEntries: [m], proactive: false
+          }));
           if (r.shouldRespond) { batchFloorTs = m.ts; hasTrigger = true; break; }   // 最早的触发消息定边界
         }
       } else {
@@ -525,9 +908,29 @@ export class Orchestrator {
     // 活跃期覆盖：必响应，读取条数与其余档位一致（统一 historyCount），
     // reason 标注活跃来源，会话页可解释"为什么 1 档设置却响应了"。
     const activeState = this.#activeState(chatKey);
-    const effectiveTier = activeState
+    const tierBeforeJudge = activeState
       ? { tier: 3, count: Math.max(0, Number(storeConfigForChat(chatKey).historyCount) || 80), reason: `活跃期（话题：${activeState.topic}）`, shouldRespond: true }
       : tierResult;
+    // 触发判定扩展点的最后一站：插件可双向覆盖（base=false→接话；base=true→不接）。
+    // 无提供者 / 非法返回 / 抛错 / >300ms → 原样返回 tierBeforeJudge，
+    // 行为与没有这个扩展点时完全一致。
+    const effectiveTier = await this.#refineWakeDecision(tierBeforeJudge, this.#wakeJudgeInfo({
+      chatKey,
+      base: tierBeforeJudge,
+      triggerEntries,
+      proactive,
+      sessionId: waitingSessionId,
+      chatName: this.chatNameCache.get(String(chatKey).split(':')[1]) || ''
+    }));
+    if (!effectiveTier.shouldRespond) {
+      // 插件判定"这次不该接话"：触发批已 drain（消息保持已读、沉入历史），
+      // 丢弃等待会话壳、不调模型 —— 与"补判定全部未触发"同一后果。
+      console.log(`[orchestrator] ${chatKey} 触发判定插件否决本次唤醒（${effectiveTier.reason || '无原因'}），消息标已读`);
+      this.store.markAllRead(chatKey);
+      if (waitingSessionId) this.#discardWaiting(waitingSessionId);
+      this.emit('chat-update', chatKey);
+      return;
+    }
 
     this.runningChats.add(chatKey);
     const seq = (this.runSeq.get(chatKey) || 0) + 1;
@@ -595,6 +998,10 @@ export class Orchestrator {
           const sentCount = (session.sent || []).length;
           const canRetry = attempt < MAX_SESSION_ATTEMPTS
             && isRetryableError(error)
+            // T-1：工具超时不是瞬时抖动。会话级重试会立刻用干净上下文再跑一遍，
+            // 大概率又撞上同一个挂住的工具、再等满一个超时预算 —— 交给 wake 末尾的
+            // 批级退避重试（默认 5s 起）更合理。
+            && error?.code !== 'TOOL_TIMEOUT'
             && sentCount === 0
             && !this.aborted;
           if (!canRetry) break;
@@ -626,6 +1033,8 @@ export class Orchestrator {
           this.sessions.finish(session.id, 'error');
           this.emit('session-end', { sessionId: session.id, chatKey, status: 'error', error: session.error });
           console.error(`[orchestrator] 运行 ${session.id} 出错:`, lastError);
+          // M-1：失败且一条未发 → 回滚触发批未读，排一次退避自动重试
+          this.#recoverFailedBatch({ chatKey, session, triggerEntries, error: lastError });
         }
       }
     } finally {
@@ -633,6 +1042,9 @@ export class Orchestrator {
       this.runningChats.delete(chatKey);
       this.emit('chat-update', chatKey);
     }
+
+    // 成功的运行清空失败重试计数：下一批触发重新获得完整的重试预算。
+    if (!lastError) this.failedBatchRetries.delete(chatKey);
 
     // drain：运行期间来的新消息 → 再次新开会话处理（这是"确保看到所有发言"的关键）
     if (!this.aborted && !this.paused) {
@@ -917,6 +1329,9 @@ export class Orchestrator {
       session,
       reminders: this.reminders,
       videoReader: this.videoReader,
+      // T-1：中止信号交给工具层。工具执行期间点「中止」时 executeTool 立即收敛
+      // （不再等工具返回），供本就不支持中途退出的工具提前结束。
+      abortSignal,
       emit: (type, payload) => this.emit(type, payload)
     };
 
@@ -1035,7 +1450,7 @@ export class Orchestrator {
       let toolCalls = msg.tool_calls ?? [];
       // 兼容：少数模型把工具调用写成文本而不是原生 tool_calls。解析成功后需要把
       // 该 assistant 消息改成 tool_calls 形态回填 messages，并追加真正的 tool 结果。
-      const rawContent = typeof msg.content === 'string' ? msg.content : '';
+      let rawContent = typeof msg.content === 'string' ? msg.content : '';
       let inlineCalls = [];
       if (!toolCalls.length && rawContent) {
         inlineCalls = parseInlineToolCalls(rawContent);
@@ -1084,6 +1499,20 @@ export class Orchestrator {
         this.emit('session-update', session.id);
       }
       if (!toolCalls.length) {
+        // ── AI 自动判断接话：先于 rescue 识别 PASS 标记 / 空正文 ──
+        // 「这轮不接」是核心与模型之间的协议：不发送、不 rescue、本批标已读。
+        // 顺序不能反 —— rescue 会把正文抢救成 send_message，PASS 若先到那里就发出去了。
+        const aiVerdict = this.#aiJudgeRoundVerdict({ rawContent, session });
+        if (aiVerdict.pass) {
+          session.contextReason = 'AI 判定不接';
+          // wake 开头 drain 已把未读标已读；这里再兜一次，保证"不接"不会留下未读
+          this.store.markAllRead(chatKey);
+          console.log(`[orchestrator] ${chatKey} AI 判定不接（${aiVerdict.why}）：不发送、不 rescue，本批消息标已读`);
+          this.sessions.update(session.id);
+          this.emit('session-update', session.id);
+          break;
+        }
+        rawContent = aiVerdict.text;
         // 没有原生工具调用。两种可能：
         //   · 模型真的说完了（文本只是思考，按设计不发 QQ）→ 正常结束
         //   · 模型不遵守工具协议，把要说的话写在了正文里 → 群友什么都收不到
@@ -1147,6 +1576,33 @@ export class Orchestrator {
         const result = blocked
           ? { content: `错误：${blocked.reason || '该工具调用被 Skill 拒绝'}`, isError: true }
           : await executeTool(toolDefs, ctx, name, argsRaw);
+        // ── T-1：工具执行期间中止 ──
+        // executeTool 用 abortSignal 与工具竞速，中止时立刻返回 aborted 结果。
+        // 这里走标准中止收尾（与轮次边界的检查同一条路径），UI 立刻退出「运行中」。
+        if (result?.aborted) {
+          this.sessionAbortMarks.delete(session.id);
+          this.sessionAbortControllers.delete(session.id);
+          this.sessions.finish(session.id, 'aborted');
+          this.emit('session-end', {
+            sessionId: session.id,
+            chatKey,
+            status: 'aborted',
+            sent: session.sent.length,
+            usage: session.usage
+          });
+          console.log(`[orchestrator] 会话 ${session.id} 在工具执行期间被用户中止（工具 ${name}）`);
+          return;
+        }
+        // ── T-1：工具执行超时 ──
+        // 以失败收敛：记计数 + 抛出非会话级可重试的错误，由 wake 统一收尾
+        // （释放并发槽 → 若一条未发则走 M-1 的批级回退重试）。
+        if (result?.timedOut) {
+          this.sessionAbortControllers.delete(session.id);
+          this.#recordReliability('toolTimeout',
+            `[reliability] 工具执行超时：${name}（会话 ${session.id}，${result.timeoutMs}ms 未返回）`,
+            { chatKey, sessionId: session.id, toolName: name, timeoutMs: result.timeoutMs });
+          throw new ToolTimeoutError(name, result.timeoutMs, session.id);
+        }
         try {
           await skillManager.runHook('after-tool', {
             ...skillContext, toolName: name, argsRaw, result, session
@@ -1257,6 +1713,14 @@ export class Orchestrator {
 
     // 收尾：发过话 = done；没发 = noreply（这是正常选项）
     const status = session.error ? 'error' : (session.sent.length > 0 ? 'done' : 'noreply');
+    // ── M-2：定向触发「零发送」的后置断言（只观测：warn + 24h 计数，不改行为）──
+    this.#alertDirectedZeroSend({
+      chatKey,
+      session,
+      triggerEntries,
+      contextReason: tierInfo?.reason,
+      status
+    });
     this.sessionAbortControllers.delete(session.id);
     this.sessions.finish(session.id, status);
     this.emit('session-end', {
@@ -1917,7 +2381,14 @@ export class Orchestrator {
       consolidating: [...this.consolidating],
       onebotConnected: this.onebot.connected,
       model: cfg.api.model,
-      maxConcurrentRuns: cfg.maxConcurrentRuns
+      maxConcurrentRuns: cfg.maxConcurrentRuns,
+      // ── 可靠性计数（近 24h）：把"漏回/静默/超时卡死"变成可观测数字 ──
+      // M-2：定向触发且正常收尾但一条没发（静默漏回）
+      missedDirected: this.#rollingCount(this.missedDirectedTimes),
+      // M-1：定向触发且运行失败未发（已回滚未读并进入自动重试）
+      unansweredDirected: this.#rollingCount(this.unansweredDirectedTimes),
+      // T-1：工具执行超时（会话已按失败收敛并释放并发槽）
+      toolTimeouts: this.#rollingCount(this.toolTimeoutTimes)
     };
   }
 }
