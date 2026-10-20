@@ -47,6 +47,7 @@ export function createRoutes(deps) {
     sanitizeConfig, keyEndpointAllowed, sanitizeProvider,
     readBody, authorize,
     qqLoginHandlers,
+    protocolSide, protocolSideHandlers,
     snowlumaDir, snowlumaWsPort, snowlumaWebuiUrl, snowlumaStatus, snowlumaLogs,
     launchSnowluma, stopSnowluma,
     // 协议端形态唯一判定点（config.resolveProtocolMode 的装配面）+ HTTP 数据面探针快照
@@ -131,9 +132,15 @@ export function createRoutes(deps) {
         // 误报成"未运行"（进而触发二次拉起 → 双实例管道冲突）。
         const webuiPort = deps.snowlumaWebuiPort();
         // 两个端口探测并行：串行时最坏 1.6s（各 800ms 超时），/api/status 每次都卡这么久
-        const [slRunning, obPortOpen] = await Promise.all([
+        // protocolSide.summary() 也并行取：它内部有 statusCacheMs 缓存，读失败按"不可管理"降级
+        // 但**必须留日志**（不许静默 catch）。
+        const [slRunning, obPortOpen, protocolManaged] = await Promise.all([
           deps.isPortOpen('127.0.0.1', webuiPort),
-          deps.isPortOpen('127.0.0.1', snowlumaWsPort())
+          deps.isPortOpen('127.0.0.1', snowlumaWsPort()),
+          protocolSide.summary().catch((error) => {
+            log('[protocol] 协议端状态摘要读取失败:', error?.message ?? error);
+            return { managed: false, running: false, state: 'unknown' };
+          })
         ]);
         // 协议端形态（唯一判定点）+ 两种红灯分开取：
         //   dataPath* = 僵尸态自检（task-6，get_csrf_token 判据，判"数据通道死没死"）
@@ -194,6 +201,8 @@ export function createRoutes(deps) {
             wsPort: protocol.wsPort,
             httpPort: protocol.httpPort
           },
+          // 容器协议端管理摘要（大对象在 GET /api/protocol/status，这里只给三字段）
+          protocolManaged,
           snowluma: {
             dir: snowlumaDir(),
             running: slRunning,
@@ -1683,6 +1692,26 @@ export function createRoutes(deps) {
         }
         return undefined;   // 已自行写响应
       }
+    },
+    // ── 容器协议端原生管理（/api/protocol/*）──────────────────────────────
+    // 鉴权：handleHttp 对全部 /api/* 的统一门；回环门 + stop/restart 确认 + 错误码映射
+    // 都在 createProtocolSideHandlers（单实现点，回环判据复用 qq-login.js 的 isLoopbackAddress）。
+    // POST 先 bodyOf 读干净请求体（keep-alive 复用），confirm 由 handler 从 body 取。
+    {
+      method: 'GET', pattern: '/api/protocol/status',
+      handler: (ctx) => protocolSideHandlers.status(ctx)
+    },
+    {
+      method: 'POST', pattern: '/api/protocol/start',
+      handler: async (ctx) => { await bodyOf(ctx.req); return protocolSideHandlers.start(ctx); }
+    },
+    {
+      method: 'POST', pattern: '/api/protocol/stop',
+      handler: async (ctx) => protocolSideHandlers.stop({ ...ctx, body: await bodyOf(ctx.req) })
+    },
+    {
+      method: 'POST', pattern: '/api/protocol/restart',
+      handler: async (ctx) => protocolSideHandlers.restart({ ...ctx, body: await bodyOf(ctx.req) })
     },
     // ── QQ 扫码登录（/api/qq-login/*）────────────────────────────────────
     // 鉴权：走 handleHttp 对全部 /api/* 的统一门（authorize + originAllowed）；

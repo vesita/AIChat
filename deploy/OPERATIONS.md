@@ -86,6 +86,21 @@ sudo bash /opt/aichat/app/deploy/install-napcat-unit.sh
 **不要用 `podman restart`**：QQ 不响应 SIGTERM，podman 10 秒后 SIGKILL，登录态会丢。
 用 `systemctl --user restart napcat.service`（单元里有 `TimeoutStopSec=90`）。
 
+## 协议端（容器）由谁管
+
+- **生命周期归 systemd**：`napcat.service` 是部署用户的 user 级 quadlet，开机是否启动由
+  `systemctl --user enable napcat.service` 决定。**AIChat 不自动拉起协议端**——它不会为了自己
+  启动而 start 容器；容器没起时 AIChat 照常起控制台，只显示「未运行」。
+- **控制台提供手动干预**：协议端卡片的状态徽标 + 启动/停止/重启按钮，后端是
+  `GET /api/protocol/status` 与 `POST /api/protocol/{start,stop,restart}`（只接受回环来源）。
+  底层动作就是 `systemctl --user <start|stop|restart> napcat.service`；
+  `aichat.service` 里的 `Environment=XDG_RUNTIME_DIR=/run/user/%U` 是它能连到该用户 user manager 的前提。
+- **停容器有掉登录态风险**：`StopTimeout=80` 只是给 QQ 优雅退出的窗口，不能保证登录态一定保住。
+  所以停止/重启必须带 `{"confirm":true}`（缺了返回 400 `CONFIRM_REQUIRED`），控制台会弹二次确认。
+- 接口语义：非外部模式 / 未识别到可管理的 systemd 用户单元 → 409 `PROTOCOL_NOT_MANAGED`；
+  动作失败或超时（`protocolSide.actionTimeoutMs`）→ 503 `PROTOCOL_ACTION_FAILED` 并带 `lastError`。
+  这些接口同时要求回环来源（403 用于非回环），与 `/api/qq-login/*` 同一道门。
+
 ## 成本观察
 
 当前响应档位是默认的「全响应」—— 群里每条消息都会触发一次 LLM 调用。

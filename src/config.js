@@ -193,6 +193,17 @@ export const DEFAULT_CONFIG = {
     credentialTtlMs: 3000000,   // WebUI 凭据缓存（NapCat 侧 1 小时有效）
     fallbackContainerQrcode: false // 应急分支：WebUI 不可用时读容器内 qrcode.png
   },
+  // 容器协议端（NapCat quadlet）原生管理。实现：src/protocol-side.js。
+  // 生命周期仍归 systemd（enabled / 开机自启由单元决定）；AIChat **不自动拉起**，
+  // 只在控制台里显示状态并提供手动 start / stop / restart。
+  protocolSide: {
+    enabled: true,             // 关闭后 /api/protocol/* 只读也不做动作（state=unknown + 说明）
+    unit: 'napcat.service',    // 用户级 systemd 单元（rootless quadlet）
+    container: 'napcat',       // 容器名（systemctl 认不到单元时用它兜底识别）
+    engine: 'auto',            // 'auto' | 'podman' | 'docker'（auto = 先 podman 后 docker）
+    actionTimeoutMs: 90000,    // start/stop/restart 上限；stop 要等 StopTimeout=80 的优雅退出
+    statusCacheMs: 2000        // 状态只读缓存：控制台轮询 /api/status 时不重复打 systemctl
+  },
   // 人设与行为
   persona: {
     botName: '小鲸鱼',

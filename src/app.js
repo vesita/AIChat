@@ -26,6 +26,7 @@ import { skillManager } from './skills/manager.js';
 import { extractCandidateUrls, dispatchMediaLinks } from './media-links.js';
 import { createRoutes } from './routes.js';
 import { createQQLogin, createQQLoginHandlers } from './qq-login.js';
+import { createProtocolSide, createProtocolSideHandlers } from './protocol-side.js';
 import * as instanceLockModule from './instance-lock.js';
 import { logger } from './logger.js';
 import { startCommunitySync, isGloballyBlocked, FIXED_PRICE_FEED_URL } from './community.js';
@@ -1460,6 +1461,12 @@ export function createApp({ log = console.log } = {}) {
   const qqLogin = createQQLogin({ getConfig, log });
   const qqLoginHandlers = createQQLoginHandlers({ qqLogin });
 
+  // 容器协议端（NapCat quadlet）原生管理：状态识别 + 手动 start/stop/restart（src/protocol-side.js）。
+  // 形态复用上面的 protocolMode()（唯一判定点）；动作恒走 `systemctl --user <action> <unit>`。
+  // ⚠️ 不自动拉起：模块构造纯惰性、无定时器；这里只构造实例，启动流程绝不调用任何动作。
+  const protocolSide = createProtocolSide({ getConfig, getProtocolMode: protocolMode, log });
+  const protocolSideHandlers = createProtocolSideHandlers({ protocolSide });
+
   // 声明式路由表（src/routes.js）：把所有依赖一次性注入。
   // 路由 handler 通过闭包取用这些依赖，handleHttp 只负责匹配分发。
   const apiRoutes = createRoutes({
@@ -1469,6 +1476,7 @@ export function createApp({ log = console.log } = {}) {
     sanitizeConfig, keyEndpointAllowed, sanitizeProvider,
     readBody, authorize,
     qqLoginHandlers,
+    protocolSide, protocolSideHandlers,
     snowlumaDir, snowlumaWsPort, snowlumaWebuiUrl, snowlumaWebuiPort, snowlumaStatus, snowlumaLogs,
     launchSnowluma, stopSnowluma,
     // 协议端形态单一判定点 + HTTP 数据面探针快照（见 createApp 内的定义）

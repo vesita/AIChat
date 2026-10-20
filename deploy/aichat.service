@@ -33,6 +33,10 @@ Environment=TZ=Asia/Shanghai
 #   的网页都进不去（自锁）。所以探到就继续，超时打印 WARN 也 exit 0。
 #   迟到的 OneBot 由代码侧自愈：src/app.js 每 2 秒探一次 OneBot 端口、端口一开立即重连，
 #   src/onebot.js 的连接循环无限退避重试 —— 不需要在这里把进程挡在门外等它。
+# 控制台的「启动/停止/重启协议端」按钮要操作同用户的 **user 级** unit（napcat.service）：
+# 本服务是系统单元，systemd 默认给的是 root 的 runtime dir，`systemctl --user` 会连错 manager。
+# 显式指向部署用户的 /run/user/<uid>（%U = User= 的 uid）才能连到该用户的 user manager。
+Environment=XDG_RUNTIME_DIR=/run/user/%U
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 5); do curl -sf -m 2 -o /dev/null http://127.0.0.1:3002/get_login_info && exit 0; sleep 1; done; echo "WARN: OneBot 未就绪，先起控制台（QQ 登录后会自动连上）" >&2; exit 0'
 ExecStart=/usr/bin/node src/server.js
 Restart=always

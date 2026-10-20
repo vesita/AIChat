@@ -68,7 +68,9 @@ async function loadSnowlumaPage({ quiet = false } = {}) {
     // U2 误报收口：外部容器模式下本页不展示内置 SnowLuma 的叙事（谁都没有启动它，
     // 也不该出现 npm run setup / 未找到目录 / 未运行 这些把人引向错误方向的假警报）。
     if (isExternalProtocolMode(s)) {
-      renderExternalProtocolPage(box, s, appLogsData);
+      // 进入页签（非 quiet）时拉一次协议端状态；SSE/动作触发的 quiet 重渲染直接用缓存，
+      // 不挂全局轮询（控制台已有 refreshMs 周期，别叠加）。
+      await renderExternalProtocolPage(box, s, appLogsData, { refreshProtocol: !quiet });
       return;
     }
     const running = !!(s.snowluma?.running);
@@ -367,91 +369,269 @@ async function loadSnowlumaPage({ quiet = false } = {}) {
 }
 
 /**
- * 外部协议端模式下的「SnowLuma」页签（U2 误报收口）。
+ * 外部容器协议端页签（U2 误报收口 + task-15 可操作卡片）。
  *
- * 现场是「宿主系统单元 AIChat + 用户级容器 NapCat」，本应用根本不管理协议端进程：
- * 显示"SnowLuma 未运行 / 未找到目录 / 请先 npm run setup"全是误报，还会把人引去
- * 装一套 Windows 协议端。所以这里整页改成三块只读事实：
- *   协议端形态（外部容器）+ OneBot 端点可达性 + HTTP/数据面探测结果 + 排障命令。
- * 协议端健康的**唯一**来源仍是 /api/status（protocol / onebot.httpOk / dataPathState），
- * 不在前端本地重新判定。
+ * 现场是「宿主系统单元 AIChat + 用户级容器 NapCat」：整页不再出现
+ * 「SnowLuma 未运行 / 未找到目录 / npm run setup」这些把人引向内置安装的假警报，
+ * 改成「可操作卡片 + OneBot 端点可达性 + HTTP/数据面探测结果 + 排障命令」。
+ *
+ * 事实来源只有一个：GET /api/protocol/status（后端 src/protocol-side.js）。
+ * 前端不自己推断容器状态、不伪造动作；按钮完全按后端给的 actions 数组渲染 ——
+ * embedded / 未安装 / 不可管理等形态不需要前端各写一套分支。
+ * 状态只在进入页签时拉一次、动作后刷新一次；quiet 重渲染读缓存，不挂全局轮询。
  */
-function renderExternalProtocolPage(box, s, appLogsData) {
-  const ob = s.onebot || {};
-  const protocol = s.protocol || {};
-  const httpOk = ob.httpOk;
-  const dataPathState = String(ob.dataPathState || '');
-  const endpoint = String(protocol.endpoint || '');
-  const self = ob.self ? `${ob.self.nickname || ''}${ob.self.userId ? `（${ob.self.userId}）` : ''}` : '';
-  const reach = ob.connected
-    ? `已连接${self ? `：${self}` : ''}`
-    : `未连接${ob.diagnosis ? `：${String(ob.diagnosis).slice(0, 160)}` : ''}`;
-  const httpText = httpOk === true
-    ? '正常'
-    : (httpOk === false
-      ? `不可用${ob.httpError ? `：${String(ob.httpError).slice(0, 120)}` : ''}`
-      : '尚未探测');
-  const appLogs = appLogsData?.logs || [];
-  const appLogLevel = appLogsData?.level || 'info';
-  const appLogText = appLogs.map((e) => {
-    const t = new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false });
-    const lv = String(e.level || 'info').toUpperCase().padEnd(5);
-    return `[${t}] [${lv}] [${e.module || '-'}] ${e.text}`;
-  }).join('\n') || '暂无日志';
+function renderExternalProtocolPage(box, s, appLogsData, { refreshProtocol = true } = {}) {
+  return (async () => {
+    if (refreshProtocol || !protocolCardState) await fetchProtocolStatus();
+    const p = protocolCardState || {};
+    const ob = s.onebot || {};
+    const protocol = s.protocol || {};
+    const httpOk = ob.httpOk;
+    const dataPathState = String(ob.dataPathState || '');
+    const endpoint = String(protocol.endpoint || '');
+    const self = ob.self ? `${ob.self.nickname || ''}${ob.self.userId ? `（${ob.self.userId}）` : ''}` : '';
+    const reach = ob.connected
+      ? `已连接${self ? `：${self}` : ''}`
+      : `未连接${ob.diagnosis ? `：${String(ob.diagnosis).slice(0, 160)}` : ''}`;
+    const httpText = httpOk === true
+      ? '正常'
+      : (httpOk === false
+        ? `不可用${ob.httpError ? `：${String(ob.httpError).slice(0, 120)}` : ''}`
+        : '尚未探测');
+    const appLogs = appLogsData?.logs || [];
+    const appLogLevel = appLogsData?.level || 'info';
+    const appLogText = appLogs.map((e) => {
+      const t = new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false });
+      const lv = String(e.level || 'info').toUpperCase().padEnd(5);
+      return `[${t}] [${lv}] [${e.module || '-'}] ${e.text}`;
+    }).join('\n') || '暂无日志';
 
-  box.innerHTML = `
-    <div class="snowluma-page-card">
-      <h2>协议端（外部容器）</h2>
-      <div class="snowluma-state-row">
-        <span class="dot dot-on"></span>
-        <span>协议端：<strong>外部容器（NapCat）</strong></span>
-        <span class="muted">进程由容器管理，本应用不启动/不关闭它</span>
-      </div>
-      <div class="snowluma-state-row">
-        <span class="dot ${ob.connected ? 'dot-on' : 'dot-off'}"></span>
-        <span>OneBot 端点：<strong>${esc(reach)}</strong></span>
-        ${endpoint ? `<span class="muted">${esc(endpoint)}</span>` : ''}
-      </div>
-      <div class="snowluma-state-row">
-        <span>HTTP 数据面：<strong>${esc(httpText)}</strong></span>
-        ${dataPathState ? `<span class="muted">数据面自检：${esc(dataPathState)}</span>` : ''}
-      </div>
-      <div class="snowluma-state-row muted" style="font-size:12px">
-        排障：<code>systemctl --user status napcat</code> · <code>podman ps | grep napcat</code> · 需要扫码时点顶栏「QQ 登录」
-      </div>
-      <div class="snowluma-actions">
-        <button class="btn btn-small" id="sl-refresh-btn">刷新状态</button>
-        <span id="sl-hint" class="muted" style="font-size:12px"></span>
-      </div>
-      <div class="sl-log-block sl-app-logs">
-        <div class="hint sl-log-head">
-          <span>应用日志（最近 ${appLogs.length} 条，同时落盘到 data/logs/）</span>
-          <label class="sl-log-level">
-            <span class="muted">落盘级别</span>
-            <select id="app-log-level" title="低于该级别的日志不写入磁盘">
-              ${['debug', 'info', 'warn', 'error'].map((v) =>
-                `<option value="${v}" ${appLogLevel === v ? 'selected' : ''}>${v}</option>`).join('')}
-            </select>
-          </label>
-          <button class="btn btn-small" id="app-logs-refresh-btn" title="重新拉取最近日志">刷新</button>
+    box.innerHTML = `
+      <div class="snowluma-page-card">
+        <h2>协议端（外部容器 · NapCat）</h2>
+        ${protocolCardHtml(p)}
+        <div class="snowluma-state-row">
+          <span class="dot ${ob.connected ? 'dot-on' : 'dot-off'}"></span>
+          <span>OneBot 端点：<strong>${esc(reach)}</strong></span>
+          ${endpoint ? `<span class="muted">${esc(endpoint)}</span>` : ''}
         </div>
-        <pre class="snowluma-logs-view" id="app-logs-view">${esc(appLogText)}</pre>
-      </div>
-    </div>`;
+        <div class="snowluma-state-row">
+          <span>HTTP 数据面：<strong>${esc(httpText)}</strong></span>
+          ${dataPathState ? `<span class="muted">数据面自检：${esc(dataPathState)}</span>` : ''}
+        </div>
+        <div class="snowluma-state-row muted" style="font-size:12px">
+          容器生命周期归 systemd 用户单元（本应用不会自动拉起）；需要扫码时点顶栏「QQ 登录」。
+          排障：<code>systemctl --user status napcat</code> · <code>podman ps | grep napcat</code>
+        </div>
+        <div class="snowluma-actions">
+          <button class="btn btn-small" id="sl-refresh-btn">刷新状态</button>
+          <span id="sl-hint" class="muted" style="font-size:12px"></span>
+        </div>
+        <div class="sl-log-block sl-app-logs">
+          <div class="hint sl-log-head">
+            <span>应用日志（最近 ${appLogs.length} 条，同时落盘到 data/logs/）</span>
+            <label class="sl-log-level">
+              <span class="muted">落盘级别</span>
+              <select id="app-log-level" title="低于该级别的日志不写入磁盘">
+                ${['debug', 'info', 'warn', 'error'].map((v) =>
+                  `<option value="${v}" ${appLogLevel === v ? 'selected' : ''}>${v}</option>`).join('')}
+              </select>
+            </label>
+            <button class="btn btn-small" id="app-logs-refresh-btn" title="重新拉取最近日志">刷新</button>
+          </div>
+          <pre class="snowluma-logs-view" id="app-logs-view">${esc(appLogText)}</pre>
+        </div>
+      </div>`;
 
-  $('#sl-refresh-btn')?.addEventListener('click', () => loadSnowlumaPage());
-  $('#app-logs-refresh-btn')?.addEventListener('click', () => loadSnowlumaPage({ quiet: true }));
-  const levelSel = $('#app-log-level');
-  if (levelSel) {
-    levelSel.addEventListener('change', async () => {
-      try {
-        const r = await api('/api/logs/level', { method: 'POST', body: JSON.stringify({ level: levelSel.value }) });
-        if (r && r.level) levelSel.value = r.level;
-        loadSnowlumaPage({ quiet: true });
-      } catch (e) {
-        const hint = $('#sl-hint');
-        if (hint) hint.textContent = `设置日志级别失败：${e.message}`;
-      }
+    // 动作按钮：只按后端给的 actions 渲染（data-protocol-action 是测试与事件绑定的唯一钩子）。
+    box.querySelectorAll('[data-protocol-action]').forEach((btn) => {
+      btn.addEventListener('click', () => { runProtocolAction(btn.dataset.protocolAction); });
     });
+    $('#sl-refresh-btn')?.addEventListener('click', () => loadSnowlumaPage());
+    $('#app-logs-refresh-btn')?.addEventListener('click', () => loadSnowlumaPage({ quiet: true }));
+    const levelSel = $('#app-log-level');
+    if (levelSel) {
+      levelSel.addEventListener('change', async () => {
+        try {
+          const r = await api('/api/logs/level', { method: 'POST', body: JSON.stringify({ level: levelSel.value }) });
+          if (r && r.level) levelSel.value = r.level;
+          loadSnowlumaPage({ quiet: true });
+        } catch (e) {
+          const hint = $('#sl-hint');
+          if (hint) hint.textContent = `设置日志级别失败：${e.message}`;
+        }
+      });
+    }
+  })();
+}
+
+// ── 协议端卡片（task-15）：状态徽标 + 动作按钮 + 二次确认 ─────────────────
+// 显示文案与动作白名单都收在这里，渲染分支只有一份 —— 后端换 actions 时前端不用改。
+
+const PROTOCOL_STATE_BADGE = {
+  running: { text: '运行中', cls: 'protocol-badge protocol-badge--ok' },
+  stopped: { text: '已停止', cls: 'protocol-badge protocol-badge--off' },
+  absent: { text: '未安装', cls: 'protocol-badge protocol-badge--warn' },
+  unknown: { text: '未知', cls: 'protocol-badge protocol-badge--na' }
+};
+
+const PROTOCOL_ACTION_LABEL = { start: '启动', stop: '停止', restart: '重启' };
+const PROTOCOL_ACTION_CLASS = { start: 'btn-primary', stop: 'btn-danger', restart: '' };
+
+// 进入页签拉一次 / 动作后刷新；不做全局轮询（quiet 重渲染直接读缓存）。
+let protocolCardState = null;   // 最近一次 GET /api/protocol/status 的响应
+let protocolCardBusy = false;   // 动作执行中：按钮 disabled + 「执行中…」
+let protocolActionError = '';   // 最近一次动作失败的可读提示
+
+/** state → 徽标（纯函数；未知值统一显示「未知」，不猜）。 */
+function protocolBadge(state) {
+  return PROTOCOL_STATE_BADGE[String(state || '')] || PROTOCOL_STATE_BADGE.unknown;
+}
+
+/** actions 渲染的唯一入口：只认后端数组，按已知动作过滤（不硬编码哪种模式有哪个按钮）。 */
+function protocolCardActions(protocol) {
+  const list = Array.isArray(protocol?.actions) ? protocol.actions : [];
+  return list.filter((a) => Object.prototype.hasOwnProperty.call(PROTOCOL_ACTION_LABEL, a));
+}
+
+/** stop / restart 会动 QQ 登录态：必须先二次确认。 */
+function protocolNeedsConfirm(action) {
+  return action === 'stop' || action === 'restart';
+}
+
+/** 确认文案：带后端 stopWarning（掉登录态风险），后端没给时给同义兜底。 */
+function protocolConfirmText(action, protocol) {
+  const label = PROTOCOL_ACTION_LABEL[action] || action;
+  const warning = String(protocol?.stopWarning || '').trim()
+    || '停止协议端可能导致 QQ 登录态失效，之后需要重新扫码登录。';
+  return `确定要${label}协议端吗？\n\n${warning}`;
+}
+
+/** 409/400/503/403 等 → 人话（错误分支的唯一渲染口径）。 */
+function protocolErrorMessage(error) {
+  const code = String(error?.code || '');
+  const data = error?.data || {};
+  const detail = String(data.error || error?.message || '').trim();
+  const lastError = String(data.lastError || '').trim();
+  if (code === 'PROTOCOL_NOT_MANAGED') return '当前不是可管理的容器协议端（AIChat 未接管协议端生命周期）';
+  if (code === 'CONFIRM_REQUIRED') return '该操作需要二次确认，请重新点击并确认';
+  if (lastError) return `协议端操作失败：${lastError}`;
+  if (code === 'PROTOCOL_ACTION_FAILED' || code === 'PROTOCOL_LAST_ERROR' || error?.status === 503) {
+    return detail ? `协议端操作失败：${detail}` : '协议端操作失败（后端未给出原因）';
   }
+  if (error?.status === 403) return '只允许本机访问：协议端管理接口要求回环来源';
+  if (error?.status === 401) return '未授权：请用带 ?token= 的地址打开控制台';
+  if (error?.status === 404) return '后端尚未提供协议端管理接口（/api/protocol/*）';
+  return detail || '请求失败';
+}
+
+async function fetchProtocolStatus() {
+  try {
+    protocolCardState = await api('/api/protocol/status');
+  } catch (error) {
+    // 接口不存在 / 非回环 / 未授权：保留上一次状态（动作按钮别消失），把可读原因显示出来
+    protocolCardState = {
+      ...(protocolCardState || {}),
+      ok: false,
+      state: protocolCardState?.state || 'unknown',
+      actions: protocolCardState?.actions || [],
+      error: protocolErrorMessage(error)
+    };
+  }
+  return protocolCardState;
+}
+
+/** 协议端卡片 HTML（唯一渲染点）。 */
+function protocolCardHtml(p) {
+  const badge = protocolBadge(p?.state);
+  const actions = protocolCardActions(p);
+  const facts = [
+    ['引擎', p?.engine || '未知'],
+    ['单元', p?.unit || '—'],
+    ['容器', p?.container || '—']
+  ].map(([k, v]) => `<span class="protocol-card__fact">${esc(k)}：<code>${esc(String(v))}</code></span>`).join('');
+  const buttons = actions.map((action) => {
+    const cls = PROTOCOL_ACTION_CLASS[action] || '';
+    const text = protocolCardBusy ? '执行中…' : PROTOCOL_ACTION_LABEL[action];
+    return `<button class="btn ${cls}" data-protocol-action="${esc(action)}"${protocolCardBusy ? ' disabled' : ''}>${esc(text)}</button>`;
+  }).join('');
+  const errorText = protocolActionError || (p?.ok === false ? String(p.error || '') : '');
+  return `
+    <div class="protocol-card" id="protocol-card" data-state="${esc(String(p?.state || 'unknown'))}">
+      <div class="protocol-card__head">
+        <span class="${badge.cls}" id="protocol-state-badge">${esc(badge.text)}</span>
+        <span class="protocol-card__title">协议端（容器）</span>
+        ${p?.managed === false ? '<span class="muted protocol-card__managed">本机不接管生命周期</span>' : ''}
+      </div>
+      <div class="protocol-card__facts">${facts}</div>
+      ${p?.detail ? `<div class="muted protocol-card__detail">${esc(String(p.detail))}</div>` : ''}
+      ${p?.lastError ? `<div class="warn-text protocol-card__lasterror" id="protocol-card-lasterror">⚠ ${esc(String(p.lastError))}</div>` : ''}
+      <div class="warn-text protocol-card__error${errorText ? '' : ' hidden'}" id="protocol-card-error">${esc(errorText)}</div>
+      ${actions.length
+        ? `<div class="protocol-card__actions">${buttons}</div>`
+        : '<div class="muted protocol-card__noactions">当前模式没有可执行的协议端操作</div>'}
+    </div>`;
+}
+
+/**
+ * 执行一个协议端动作：stop/restart 先二次确认（取消则一个请求都不发）；
+ * 执行中按钮 disabled + 「执行中…」；结束后刷新状态并 toast 结果。
+ */
+async function runProtocolAction(action) {
+  if (protocolCardBusy) return;
+  if (!Object.prototype.hasOwnProperty.call(PROTOCOL_ACTION_LABEL, action)) return;
+  if (protocolNeedsConfirm(action)) {
+    const ok = await uiConfirm(protocolConfirmText(action, protocolCardState), {
+      title: `⚠️ 确认${PROTOCOL_ACTION_LABEL[action]}协议端`,
+      okText: `确认${PROTOCOL_ACTION_LABEL[action]}`,
+      cancelText: '取消'
+    });
+    if (!ok) return;      // 取消：不发任何请求（不变量：危险动作必须显式确认）
+  }
+  protocolCardBusy = true;
+  protocolActionError = '';
+  const box = $('#snowluma-page');
+  if (box) {
+    box.querySelectorAll('[data-protocol-action]').forEach((b) => { b.disabled = true; });
+    const button = box.querySelector(`[data-protocol-action="${action}"]`);
+    if (button) button.textContent = '执行中…';
+  }
+  try {
+    const body = protocolNeedsConfirm(action) ? JSON.stringify({ confirm: true }) : '{}';
+    const result = await api(`/api/protocol/${action}`, { method: 'POST', body });
+    protocolCardBusy = false;
+    await fetchProtocolStatus();
+    await loadSnowlumaPage({ quiet: true });
+    const label = PROTOCOL_ACTION_LABEL[action] || action;
+    const after = result?.stateAfter ? `（${protocolBadge(result.stateAfter).text}）` : '';
+    showProtocolToast(`${label}完成${after}`);
+  } catch (error) {
+    protocolCardBusy = false;
+    protocolActionError = protocolErrorMessage(error);
+    // 503 的 lastError 优先展示；同时刷新状态，让 detail/lastError 与后端一致
+    await fetchProtocolStatus();
+    await loadSnowlumaPage({ quiet: true });
+    showProtocolToast(protocolActionError, { error: true });
+  }
+}
+
+let protocolToastTimer = null;
+/** 极简 toast：固定右下、4 秒自动消失（不引依赖、不改页面布局）。 */
+function showProtocolToast(text, { error = false } = {}) {
+  const content = String(text || '').trim();
+  if (!content) return;
+  let el = $('#protocol-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'protocol-toast';
+    document.body.appendChild(el);
+  }
+  el.className = 'protocol-toast' + (error ? ' protocol-toast--error' : '');
+  el.textContent = content;
+  uiShow(el, () => el.classList.remove('hidden'), false);
+  if (protocolToastTimer) clearTimeout(protocolToastTimer);
+  protocolToastTimer = setTimeout(() => {
+    protocolToastTimer = null;
+    uiHide(el, () => el.classList.add('hidden'), false);
+  }, 4000);
 }
