@@ -112,3 +112,68 @@ curl -X POST http://127.0.0.1:3210/api/config \
 `smart-wake` 打开后会在「核心判定说不接」时用本地启发式决定要不要接（问句/延续对话加分，刷屏/复读/命令抑制，
 每群 90s 冷却、每小时 12 条/每天 60 条上限）；觉得变吵就调高 `escalateThreshold` 或关 `settings.enabled`。
 `token-saver` 的 `before-llm-messages` 只裁【已读信息】最旧部分，不碰未读/当前触发批/工具消息。
+
+## 参与策略：什么时候开口（三选一）
+
+`store.participationMode` 是唯一的选择入口（控制台「设置 → 参与策略」也是写它）：
+
+| 模式 | 判定 | 用到的参数 |
+|---|---|---|
+| `probability`（默认） | 按响应滑条的档位 + 随机概率（1 档仅 @ / 2 档 +关键词 / 3 档 +随机 / 4 档全响应） | `store.contextSliderPos` |
+| `ai` | 群聊里**非定向**消息全部交给模型自己判断要不要接；定向消息（@ / 拍一拍 / 私聊）必回 | `store.aiJudge.*` |
+| `directed` | 只回 @ / 拍一拍 / 关键词命中 / 私聊；不随机、不看滑条 | `store.keywords` |
+
+- 旧配置没有 `participationMode` 时按 `probability` 处理（行为与旧版一致）。
+- `ai` 模式下系统提示会自动追加一段【群聊参与守则（自动判断）】：模型判断"这轮不接"时
+  **只输出 `store.aiJudge.passMarker`**（默认 `[[PASS]]`），核心在回复安全网（rescue）之前识别并
+  丢弃 —— 不发送、不抢救、本批消息标已读，会话的 `contextReason` 记为「AI 判定不接」。
+- `store.aiJudge.minGapSec > 0` 时，同群两次 AI 判定至少间隔这么久（秒）；间隔内到达的消息
+  照常进未读，等下一条触发时一起判定（防止消息风暴里每句都调模型）。
+- `ai` 模式下不再咨询 `reply.interest-judge`（smart-wake）：两套判定同时开会互相打架。
+  想用 AI 判定就关掉 smart-wake 的行为开关，反之亦然。
+- 关键词（`store.keywords`）只在 `directed` 模式与 `probability` 的 2 档生效；`ai` 模式下
+  关键词不再单独触发（都交给模型判断）。
+
+开启 AI 判定（也可以直接在控制台「参与策略」里点选，二者等价）：
+
+```bash
+curl -X POST http://127.0.0.1:3210/api/config -H 'content-type: application/json' \
+  -d '{"store":{"participationMode":"ai","aiJudge":{"enabled":true,"passMarker":"[[PASS]]","minGapSec":0}}}'
+```
+
+切回固定概率 / 仅定向（记得同步关掉 `aiJudge.enabled`，控制台会自动同步）：
+
+```bash
+curl -X POST http://127.0.0.1:3210/api/config -H 'content-type: application/json' \
+  -d '{"store":{"participationMode":"probability","aiJudge":{"enabled":false}}}'
+```
+
+## 出站硬上限（安全保险丝：2000 条 / 滚动 1 小时）
+
+`store.limits.maxMessagesPerHour`（默认 **2000**，`0` = 不限）是**全局**出站闸门，
+在唯一发送出口 `src/sender.js`（SendQueue）里生效：
+
+- **滚动窗口**：不是自然小时。每次发送前剔除 1 小时前的记录，窗口内计数 `>=` 上限就拒绝。
+- **只计成功发送**：文本 / 图片 / 表情 / 媒体 / 拍一拍 / 提醒，凡真正发到 QQ 的都计入；
+  失败与去重跳过的**不计**。所有会话共享同一份计数（不是每群 2000）。
+- **拒绝语义**：不排队、不重试，立即返回结构化错误（`error.code = 'OUTBOUND_HARD_LIMIT'`，
+  带 `limit` / `count`）；工具调用方会把这句错误回给模型。
+- **并发安全**：检查与"占额度"在同一段同步代码里完成（成功后转正式计数、失败释放），
+  多会话并发发送也不会超出上限。
+
+调上限：
+
+```bash
+curl -X POST http://127.0.0.1:3210/api/config -H 'content-type: application/json' \
+  -d '{"store":{"limits":{"maxMessagesPerHour":500}}}'      # 收紧到 500
+# -d '{"store":{"limits":{"maxMessagesPerHour":0}}}'        # 关闭上限（不建议）
+```
+
+触发时的现象与排查：
+
+- 日志关键字：`[sender] 出站硬上限已触发：滚动 1 小时内已成功发送 N 条（上限 M），本次发送被拒绝`
+  —— **同一自然小时只打一次**，不会刷屏。
+- 表现：机器人突然不说话了，会话/工具结果里能看到「出站硬上限：滚动 1 小时内最多发送 M 条消息」；
+  未读标记与其它会话不受影响，等窗口滚过（旧记录满 1 小时）后自动恢复。
+- 先确认是不是真的异常高频（群聊被刷屏 / 模型复读）：看存档里 `self=true` 的条数；
+  正常闲聊远到不了 2000/小时，触发即说明有异常放大，先把上限当保险丝而不是当节流阀。

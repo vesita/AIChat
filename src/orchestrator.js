@@ -8,7 +8,7 @@
 //
 // 同一会话（群/私聊）同时最多一个运行；运行期间新消息只写 JSON（未读），不叠加触发。
 // 不同会话之间并行，受 maxConcurrentRuns 全局限流。
-import { getConfig, storeConfigForChat, personaForChat } from './config.js';
+import { getConfig, storeConfigForChat, personaForChat, isAiJudgeMode, aiJudgePassMarker } from './config.js';
 import { vendorOfConfig } from './model-prices.js';
 import { randInt } from './util.js';
 import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from './prompt.js';
@@ -69,6 +69,10 @@ export class Orchestrator {
     // 自判"是否仍在话题上"，偏离/结束则 finish("话题结束") 退出活跃期。
     // 到期自动退出兜底（LLM 忘了判断也不会永远活跃）。
     this.activeTopics = new Map();
+    // ── AI 自动判断接话（participationMode='ai'）──
+    // chatKey -> 上一次发起 AI 判定的时间戳。minGapSec>0 时用它做节流：
+    // 风暴期里不是每句都值得调模型；间隔内的消息留在未读，等下一次触发一起判。
+    this.aiJudgeLastAt = new Map();
     // ── 提示词锚点（前缀缓存深化，2026-09-25）──
     // chatKey -> { readIds, readCount, memberIds }：上一轮发给模型的
     // 【记忆】+【已读信息】前缀状态。下一轮 buildUserPrompt 据此判断能否
@@ -235,6 +239,10 @@ export class Orchestrator {
   /** 落闸门：触发 → 排定唤醒；不触发 → 标已读（只标这一条）。 */
   #applyIncomingDecision(chatKey, entry, decision) {
     if (decision?.shouldRespond) {
+      // AI 判定节流：minGapSec 内不重复发起判定。消息保持未读（不标已读），
+      // 等间隔过去后的下一次触发把积压一起判 —— 既止住消息风暴里的模型调用，
+      // 又不丢消息（它们仍会进下一次的【未读信息】）。
+      if (decision.reason === 'AI 判定' && this.#aiJudgeGapBlocked(chatKey)) return;
       this.scheduleWake(chatKey, null, { verified: true });
       return;
     }
@@ -259,6 +267,62 @@ export class Orchestrator {
   }
 
   /**
+   * AI 判定节流：同群两次判定之间至少间隔 minGapSec。
+   * @returns {boolean} true = 还在间隔内，这次不发起判定（消息保持未读）
+   */
+  #aiJudgeGapBlocked(chatKey) {
+    const sec = Math.max(0, Math.min(3600, Number(getConfig().store?.aiJudge?.minGapSec) || 0));
+    if (sec <= 0) return false;
+    const now = Date.now();
+    const last = this.aiJudgeLastAt.get(chatKey) || 0;
+    if (last && now - last < sec * 1000) {
+      console.log(`[orchestrator] ${chatKey} AI 判定节流中（距上次 ${Math.round((now - last) / 1000)}s < ${sec}s），消息留未读等下次`);
+      return true;
+    }
+    this.aiJudgeLastAt.set(chatKey, now);
+    return false;
+  }
+
+  /**
+   * AI 自动判断接话：识别本轮正文里的约定标记（PASS = 这轮不接）。
+   *
+   * ⚠️ 必须**先于** rescueUnsentReply 调用：模型把要说的话写在正文里时，回复
+   * 安全网会把它抢救成 send_message；PASS 标记若先被 rescue 看到，就会变成一条
+   * 真的发进群的消息（内容还是 "[[PASS]]"）。
+   *
+   * 判定规则（契约）：
+   *   · 非 AI 模式 → 原样放行（行为与没有这个功能时逐字节一致）；
+   *   · 正文 trim == marker（或只剩 marker 行）→ 不接（pass）；
+   *   · 正文为空 且 本次运行没有成功发送 → 不接（pass）；
+   *   · 正文含 marker + 其它内容 → 剥掉 marker 后按正常正文处理；
+   *   · 定向批（被艾特/拍了拍我/私聊）→ **不接受 PASS**（"必回"是硬语义），
+   *     但 marker 仍然剥掉，绝不把标记本身当正文发出去。
+   */
+  #aiJudgeRoundVerdict({ rawContent, session }) {
+    const store = getConfig().store || {};
+    if (!isAiJudgeMode(store)) return { pass: false, text: rawContent, why: '' };
+    const marker = aiJudgePassMarker(store);
+    const text = String(rawContent ?? '');
+    const trimmed = text.trim();
+    const directed = ['被艾特', '拍了拍我', '私聊消息'].includes(String(session?.contextReason || ''));
+
+    if (!trimmed) {
+      // 空正文：本轮没有发过任何消息才算"不接"；已经发过就不改动正常收尾。
+      if (!directed && !(session?.sent?.length)) return { pass: true, text: '', why: '空正文且未发送' };
+      return { pass: false, text, why: '' };
+    }
+    // 去掉"整行只有 marker"的行，再清掉残留的 marker 子串
+    let rest = text.split('\n').filter((line) => line.trim() !== marker).join('\n');
+    if (rest.includes(marker)) rest = rest.split(marker).join('');
+    rest = rest.trim();
+    if (!rest) {
+      if (directed) return { pass: false, text: '', why: '' };   // 定向必回：不接受 PASS
+      return { pass: true, text: '', why: '正文只有 PASS 标记' };
+    }
+    return { pass: false, text: rest === trimmed ? text : rest, why: '' };
+  }
+
+  /**
    * 这次判定该不该咨询插件。
    *
    * 私聊 / 被艾特 / 拍了拍我 = 核心已确定"这是直接召唤"，不是"要不要接话"的
@@ -266,6 +330,9 @@ export class Orchestrator {
    */
   #judgeEligible(base, info) {
     if (info?.kind === 'private') return false;
+    // AI 自动判断模式：要不要接话已经交给模型自己判断了，本地启发式插件不再插嘴
+    //（两套判定同时生效会互相打架：smart-wake 否决 vs 模型 PASS，口径不可解释）。
+    if (isAiJudgeMode(getConfig().store)) return false;
     const reason = String(base?.reason || '');
     return reason !== '私聊消息' && reason !== '被艾特' && reason !== '拍了拍我';
   }
@@ -1230,7 +1297,7 @@ export class Orchestrator {
       let toolCalls = msg.tool_calls ?? [];
       // 兼容：少数模型把工具调用写成文本而不是原生 tool_calls。解析成功后需要把
       // 该 assistant 消息改成 tool_calls 形态回填 messages，并追加真正的 tool 结果。
-      const rawContent = typeof msg.content === 'string' ? msg.content : '';
+      let rawContent = typeof msg.content === 'string' ? msg.content : '';
       let inlineCalls = [];
       if (!toolCalls.length && rawContent) {
         inlineCalls = parseInlineToolCalls(rawContent);
@@ -1279,6 +1346,20 @@ export class Orchestrator {
         this.emit('session-update', session.id);
       }
       if (!toolCalls.length) {
+        // ── AI 自动判断接话：先于 rescue 识别 PASS 标记 / 空正文 ──
+        // 「这轮不接」是核心与模型之间的协议：不发送、不 rescue、本批标已读。
+        // 顺序不能反 —— rescue 会把正文抢救成 send_message，PASS 若先到那里就发出去了。
+        const aiVerdict = this.#aiJudgeRoundVerdict({ rawContent, session });
+        if (aiVerdict.pass) {
+          session.contextReason = 'AI 判定不接';
+          // wake 开头 drain 已把未读标已读；这里再兜一次，保证"不接"不会留下未读
+          this.store.markAllRead(chatKey);
+          console.log(`[orchestrator] ${chatKey} AI 判定不接（${aiVerdict.why}）：不发送、不 rescue，本批消息标已读`);
+          this.sessions.update(session.id);
+          this.emit('session-update', session.id);
+          break;
+        }
+        rawContent = aiVerdict.text;
         // 没有原生工具调用。两种可能：
         //   · 模型真的说完了（文本只是思考，按设计不发 QQ）→ 正常结束
         //   · 模型不遵守工具协议，把要说的话写在了正文里 → 群友什么都收不到

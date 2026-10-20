@@ -11,6 +11,9 @@ import { mdToPlain, splitForQQ } from './md-to-plain.js';
 // 限频回退值统一取自 DEFAULT_CONFIG，杜绝"代码默认 80 / 回退值 8 / UI 回退 8"三处打架。
 const DEFAULT_MAX_PER_MINUTE = DEFAULT_CONFIG.send.maxPerMinute;
 const DEFAULT_MAX_PER_HOUR = DEFAULT_CONFIG.send.maxPerHour;
+// 出站硬上限的滚动窗口（1 小时）与默认值（2000 条）。0 = 不限。
+const OUTBOUND_WINDOW_MS = 3600000;
+const DEFAULT_MAX_MESSAGES_PER_HOUR = DEFAULT_CONFIG.store?.limits?.maxMessagesPerHour ?? 2000;
 
 /**
  * 本地路径 → OneBot 能识别的 file URI。
@@ -41,10 +44,18 @@ export function toFileUri(input) {
 }
 
 export class SendQueue {
-  constructor({ onebot, store, onSent = null, log = null }) {
+  constructor({ onebot, store, onSent = null, log = null, now = null }) {
     this.onebot = onebot;
     this.store = store;
     this.onSent = onSent;
+    // 可注入时钟（测试用假时间验证滚动窗口；生产恒为 Date.now）
+    this.now = typeof now === 'function' ? now : Date.now;
+    // ── 出站硬上限（全局安全保险丝）──
+    // outboundTimes: 最近 1 小时内**成功发送**的时间戳（所有会话共享这一份）
+    // outboundReserved: 已通过闸门、尚未出结果的并发发送占位（失败/去重会释放）
+    this.outboundTimes = [];
+    this.outboundReserved = 0;
+    this.outboundWarnHour = -1;
     // 回退/降级这类"行为变了但没报错"的事必须留痕，否则排查时看不到曾经降级过
     this.log = typeof log === 'function' ? log : null;
     this.chains = new Map();      // chatKey -> enqueue fn
@@ -128,6 +139,57 @@ export class SendQueue {
     return Math.min(15000, Math.max(min, randInt(min, max) * 0.5 + byLength * 0.5));
   }
 
+  /** 出站硬上限（条/滚动 1 小时；0 = 不限）。 */
+  #outboundLimit() {
+    const raw = getConfig().store?.limits?.maxMessagesPerHour;
+    if (raw === null || raw === undefined || raw === '') return DEFAULT_MAX_MESSAGES_PER_HOUR;
+    const n = Number(raw);
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : DEFAULT_MAX_MESSAGES_PER_HOUR;
+  }
+
+  /**
+   * 出站硬上限闸门：同步完成「prune 过期记录 → 检查 → 占位」。
+   *
+   * 为什么需要占位：语义要求"只计**成功**发送"，所以检查时不能直接记账；
+   * 但检查与成功之间隔着 await，多会话并发时都可能在"未满"时通过检查、
+   * 一起发出去从而超过上限。占位把这段并发窗口的额度在**同步代码**里先扣掉
+   *（JS 单线程，prune/检查/占位之间没有 yield），成功后转正式记录、失败释放。
+   *
+   * @returns {{commit: Function, release: Function}} 发送成功调 commit，失败调 release
+   */
+  #reserveOutbound() {
+    const limit = this.#outboundLimit();
+    const record = () => { this.outboundTimes.push(this.now()); };
+    // 0 = 不限：不跟踪（也不记时间戳，避免关闭上限时内存无意义增长）。
+    // 从 0 改成有限值的瞬间从零开始计（把「关闭期间发过的历史」算进来没有意义）。
+    if (limit <= 0) return { commit: () => {}, release: () => {} };
+    const now = this.now();
+    // 滚动窗口：只保留最近 1 小时内的成功记录
+    this.outboundTimes = this.outboundTimes.filter((t) => now - t < OUTBOUND_WINDOW_MS);
+    const used = this.outboundTimes.length + this.outboundReserved;
+    if (used >= limit) {
+      // 同一自然小时只告警一次：闸门持续触发时日志不能刷屏
+      const hour = Math.floor(now / OUTBOUND_WINDOW_MS);
+      if (this.outboundWarnHour !== hour) {
+        this.outboundWarnHour = hour;
+        console.warn(`[sender] 出站硬上限已触发：滚动 1 小时内已成功发送 ${this.outboundTimes.length} 条（上限 ${limit}），本次发送被拒绝（不排队、不重试）`);
+      }
+      const error = new Error(`出站硬上限：滚动 1 小时内最多发送 ${limit} 条消息，本次发送被拒绝（不排队、不重试）`);
+      error.code = 'OUTBOUND_HARD_LIMIT';
+      error.limit = limit;
+      error.count = this.outboundTimes.length;
+      throw error;
+    }
+    this.outboundReserved += 1;
+    return {
+      commit: () => {
+        this.outboundReserved = Math.max(0, this.outboundReserved - 1);
+        record();
+      },
+      release: () => { this.outboundReserved = Math.max(0, this.outboundReserved - 1); }
+    };
+  }
+
   /**
    * 发送一批文本消息（一条或多条）。
    * options: { replyToMessageId, atUserId }
@@ -165,10 +227,19 @@ export class SendQueue {
           console.warn(`[sender] 跳过重复消息（${this.#dedupeWindow()}ms 内已发过相同内容）：${String(text).slice(0, 30)}`);
           return { text, messageId: null, at: formatClockTime(Date.now()), deduped: true };
         }
-        const data = await this.onebot.sendText(kind, id, text, {
-          replyToMessageId: i === 0 ? options.replyToMessageId : null, // 引用挂在第一条上：回的就是那条
-          atUserId: i === 0 ? options.atUserId : null
-        });
+        // 出站硬上限：真正发到 QQ 的每一条都计入（@ 回复/AI 接话/提醒一视同仁）
+        const gate = this.#reserveOutbound();
+        let data;
+        try {
+          data = await this.onebot.sendText(kind, id, text, {
+            replyToMessageId: i === 0 ? options.replyToMessageId : null, // 引用挂在第一条上：回的就是那条
+            atUserId: i === 0 ? options.atUserId : null
+          });
+        } catch (error) {
+          gate.release();   // 失败不占额度（允许重试）
+          throw error;
+        }
+        gate.commit();
         this.#markSent(chatKey, text);   // 只有 OneBot 成功返回后才记入去重窗口
         const ts = Date.now();
         this.store.appendSelf(chatKey, { text, ts, mid: data?.message_id ?? null });
@@ -185,12 +256,26 @@ export class SendQueue {
       if (r.status === 'fulfilled') sent.push(r.value);
       // 带上 index 和原文：调用方需要知道"哪一条"失败了（才能重发或告知模型）。
       // 原先 failed 里只有 error，没有任何定位信息。
-      else failed.push({ index: i, text: parts[i], error: String(r.reason?.message ?? r.reason) });
+      else failed.push({
+        index: i,
+        text: parts[i],
+        error: String(r.reason?.message ?? r.reason),
+        code: r.reason?.code || null,
+        limit: r.reason?.limit,
+        count: r.reason?.count
+      });
     }
     // 部分成功也要让调用方知道：原先只在"全败"时抛错，部分成功会静默丢消息
     if (failed.length > 0) {
       const detail = failed.map((f) => `第${f.index + 1}条「${String(f.text).slice(0, 20)}」：${f.error}`).join('；');
-      if (sent.length === 0) throw new Error(detail);
+      if (sent.length === 0) {
+        const error = new Error(detail);
+        // 结构化原因不能在这里丢掉：出站硬上限要能让上层/日志区分"被保险丝挡了"
+        // 与"协议端报错"（两者处置完全不同：前者不该重试、后者可以）。
+        const hard = failed.find((f) => f.code === 'OUTBOUND_HARD_LIMIT');
+        if (hard) { error.code = hard.code; error.limit = hard.limit; error.count = hard.count; }
+        throw error;
+      }
       console.warn(`[sender] 部分发送失败（${failed.length}/${parts.length}）：${detail}`);
     }
     return { sent, failed };
@@ -215,9 +300,12 @@ export class SendQueue {
         replyToMessageId: options.replyToMessageId ?? null,
         atUserId: options.atUserId ?? null
       });
-      let data;
       const primary = String(sticker.url || '').trim();
       if (!primary) throw new Error(`表情 ${sticker.id} 没有可发送的图片地址`);
+      // 出站硬上限：一次逻辑发送只占一个额度（下面的回退重试不重复计数）
+      const gate = this.#reserveOutbound();
+      let data;
+      try {
       try {
         data = await sendVia(primary);
       } catch (firstError) {
@@ -258,6 +346,11 @@ export class SendQueue {
         }
         }
       }
+      } catch (error) {
+        gate.release();   // 一次都没发成功 → 释放额度（不占上限）
+        throw error;
+      }
+      gate.commit();
       const ts = Date.now();
       this.store.appendSelf(chatKey, { text: `[表情包:${sticker.desc || sticker.localNote || sticker.id}]`, ts, mid: data?.message_id ?? null });
       this.onSent?.({ chatKey, text: `[表情包]`, messageId: data?.message_id ?? null, sticker: sticker.id });
@@ -306,6 +399,8 @@ export class SendQueue {
       this.#checkRate(chatKey);
       await sleep(randInt(500, 1300));   // 发图前真人式的短暂停顿
 
+      // 出站硬上限：一张图 = 一个额度（file→base64 的回退不重复计数）
+      const gate = this.#reserveOutbound();
       let data;
       try {
         data = await this.onebot.sendImage(kind, id, ref, {
@@ -315,13 +410,19 @@ export class SendQueue {
       } catch (error) {
         // file:// 失败 → 回退 base64（协议端不同机、路径不可读、权限不足等）。
         // 只在**有 dataUrl 备份**且**确实是 local 路径**时才回退，避免无意义重试。
-        if (!file || !dataUrl) throw error;
+        if (!file || !dataUrl) { gate.release(); throw error; }
         this.log?.(`本地路径发送失败（${error?.message ?? error}），回退 base64 重试一次`);
-        data = await this.onebot.sendImage(kind, id, dataUrl, {
-          replyToMessageId: options.replyToMessageId ?? null,
-          atUserId: options.atUserId ?? null
-        });
+        try {
+          data = await this.onebot.sendImage(kind, id, dataUrl, {
+            replyToMessageId: options.replyToMessageId ?? null,
+            atUserId: options.atUserId ?? null
+          });
+        } catch (retryError) {
+          gate.release();
+          throw retryError;
+        }
       }
+      gate.commit();
       this.#markSent(chatKey, `__img__${dedupeKey}`);   // 发图同样：成功后才记账
       const ts = Date.now();
       const note = options.note ? `:${String(options.note).slice(0, 40)}` : '';
@@ -362,7 +463,16 @@ export class SendQueue {
       }
       this.#checkRate(chatKey);
       await sleep(randInt(800, 1800));   // 视频/多图体积大，停顿比文字长一点
-      const data = await this.onebot.sendSegments(kind, id, segs);
+      // 出站硬上限：一条媒体（可能含多段）= 一个额度
+      const gate = this.#reserveOutbound();
+      let data;
+      try {
+        data = await this.onebot.sendSegments(kind, id, segs);
+      } catch (error) {
+        gate.release();
+        throw error;
+      }
+      gate.commit();
       this.#markSent(chatKey, `__media__${dedupeKey}`);   // 成功后才记账
       const ts = Date.now();
       this.store.appendSelf(chatKey, { text: label, ts, mid: data?.message_id ?? null });
@@ -379,7 +489,16 @@ export class SendQueue {
       // 可以绕过 maxPerMinute/maxPerHour 刷屏
       this.#checkRate(chatKey);
       await sleep(randInt(300, 900));
-      const data = await this.onebot.sendPoke(kind, id, targetUserId);
+      // 拍一拍也是发到 QQ 的出站动作，同样计入硬上限
+      const gate = this.#reserveOutbound();
+      let data;
+      try {
+        data = await this.onebot.sendPoke(kind, id, targetUserId);
+      } catch (error) {
+        gate.release();
+        throw error;
+      }
+      gate.commit();
       const ts = Date.now();
       const target = kind === 'group' && targetUserId != null ? ` ${targetUserId}` : '对方';
       this.store.appendSelf(chatKey, { text: `[拍一拍] 你拍了拍${target}`, ts, mid: data?.message_id ?? null });

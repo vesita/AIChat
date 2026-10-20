@@ -406,6 +406,21 @@ function bindSettingsEvents(c) {
   const acRoot = $('#ac-editor');
   if (acRoot) mountActiveConfigEditor(acRoot);
 
+  // ── 参与策略：模式卡片 = 单选 + 只显示选中模式的参数区 ──
+  // 三张卡片共用 name="pmode" 的 radio；change 事件会冒泡到 #settings-form，
+  // 触发既有的 dirty 自动保存（saveConfig 的 participation 分支收集新字段）。
+  const pmodeInputs = $$('input[name="pmode"]');
+  if (pmodeInputs.length) {
+    const syncPmode = () => {
+      const checked = pmodeInputs.find((x) => x.checked) || pmodeInputs[0];
+      const mode = checked ? checked.value : 'probability';
+      $$('.pmode-card').forEach((el) => el.classList.toggle('on', el.dataset.mode === mode));
+      $$('.pmode-body').forEach((el) => { el.hidden = el.dataset.pmode !== mode; });
+    };
+    pmodeInputs.forEach((x) => x.addEventListener('change', syncPmode));
+    syncPmode();
+  }
+
   // ── 屏蔽名单 ──
   $('#blocklist-btn')?.addEventListener('click', () => openBlocklistModal());
 

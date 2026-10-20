@@ -44,6 +44,7 @@ function renderSettingsSidebar() {
     ['memory', '记忆'],
     ['persona', '人设'],
     ['allow', '聊天白名单'],
+    ['participation', '参与策略'],
     ['chat', '聊天设置'],
     ['desktop', '桌面端'],
     ['onebot', 'OneBot（SnowLuma）'],
@@ -159,6 +160,7 @@ function renderSettingsSection(c) {
     memory: () => renderMemorySettingsSection(c),
     persona: () => renderPersonaSection(c),
     allow: () => renderAllowSection(c),
+    participation: () => renderParticipationSection(c),
     chat: () => renderChatSection(c),
     desktop: () => renderDesktopSection(c),
     onebot: () => renderOnebotSection(c),
@@ -828,6 +830,107 @@ const TIER_HINT = {
   3: '在 2 档基础上，再按概率随机响应一些消息',
   4: '任何消息都响应（改造前的行为，最费 token）'
 };
+
+/**
+ * 参与策略（选择驱动）：先选"什么时候开口"，再显示该策略的参数。
+ *
+ * 设计意图：以前的响应滑条/关键词/AI 开关散落在不同卡片里，用户看不出它们
+ * 是互斥的"同一件事的三种做法"。这里用单选卡片把它们收口成一个选择，
+ * 选中哪一种就只显示哪一种的参数；「安全上限」与「上下文预算」是三种模式
+ * 都生效的全局项，单独成卡。
+ *
+ * 固定概率模式的滑条直接复用「聊天设置 → 活跃设置」的编辑器（#ac-editor，
+ * 由 09-community 的 mountActiveConfigEditor 原地挂载）——同一个值只有一个
+ * 编辑入口，不复制组件。
+ */
+function renderParticipationSection(c) {
+  const st = c.store || {};
+  const MODES = [['probability', '固定概率', '🎲', '按响应滑条的档位 + 随机概率决定接不接。默认模式，行为与旧版一致。'],
+    ['ai', 'AI 自动判断', '🤖', '群聊消息交给模型自己判断；不接时只输出 [[PASS]]（核心丢弃，不发群）。@/拍一拍/私聊必回。'],
+    ['directed', '仅定向', '🎯', '只回被 @、被叫到关键词、或私聊时的消息；不随机、不看滑条。']];
+  const mode = MODES.some(([id]) => id === st.participationMode) ? st.participationMode : 'probability';
+  const ai = st.aiJudge || {};
+  const limits = st.limits || {};
+  const marker = String(ai.passMarker || '[[PASS]]');
+  const minGapSec = Math.max(0, Number(ai.minGapSec) || 0);
+  const capRaw = Number(limits.maxMessagesPerHour);
+  const maxPerHour = Number.isFinite(capRaw) ? Math.max(0, Math.floor(capRaw)) : 2000;
+  const historyCount = Math.min(500, Math.max(80, Number(st.historyCount) || 80));
+  const fold = (typeof setCard === 'function') ? setCard : (o) => `<div class="setcard">${o.body}</div>`;
+  const modeLabel = (MODES.find(([id]) => id === mode) || MODES[0])[1];
+  return `
+    <h3 id="settings-participation">参与策略</h3>
+    <p class="setsub">机器人什么时候开口 —— 先选策略，再调这套策略自己的参数。改动即时生效。</p>
+    ${fold({
+      id: 'card-participation-mode',
+      icon: '🎛',
+      title: '参与策略',
+      sub: '固定概率 / AI 自动判断 / 仅定向',
+      val: esc(modeLabel),
+      open: true,
+      body: `
+      <div class="pmode-grid">
+        ${MODES.map(([id, name, icon, desc]) => `
+          <label class="pmode-card${id === mode ? ' on' : ''}" data-mode="${id}">
+            <input type="radio" name="pmode" value="${id}" ${id === mode ? 'checked' : ''} />
+            <span class="pmode-icon">${icon}</span>
+            <span class="pmode-text"><b>${name}</b><span>${desc}</span></span>
+          </label>`).join('')}
+      </div>
+      <div class="pmode-body" data-pmode="probability"${mode === 'probability' ? '' : ' hidden'}>
+        <div class="hint">响应滑条（与「聊天设置 → 活跃设置」是同一个值，二选一入口）：</div>
+        <div id="ac-editor"></div>
+      </div>
+      <div class="pmode-body" data-pmode="ai"${mode === 'ai' ? '' : ' hidden'}>
+        <div class="field-row">
+          <div class="field"><label>两次 AI 判定最小间隔（秒，0 = 不限制）</label>
+            <input type="number" id="aj-mingap" min="0" max="3600" step="1" value="${esc(minGapSec)}" />
+            <div class="hint">消息风暴里不是每句都值得调模型：间隔内的消息照常进未读，等下一次判定一起看。</div></div>
+        </div>
+        <details class="pm-adv">
+          <summary>高级：不接话标记</summary>
+          <div class="field"><label>PASS 标记（模型只输出它 = 这轮不接）</label>
+            <input type="text" id="aj-marker" maxlength="32" value="${esc(marker)}" />
+            <div class="hint">系统提示里的守则与核心短路都用这个值，改一处即两处生效。</div></div>
+        </details>
+      </div>
+      <div class="pmode-body" data-pmode="directed"${mode === 'directed' ? '' : ' hidden'}>
+        <div class="hint">只回被 @、被叫到关键词、或私聊。关键词一行一个：</div>
+        <div class="field"><label>关键词表</label>
+          <textarea id="pm-keywords" rows="4" placeholder="小鲸鱼">${esc((st.keywords || []).join('\n'))}</textarea>
+          <div class="hint">例如填「小鲸鱼」= 群里有人提到这三个字就算定向；@ 与拍一拍不需要配置。</div></div>
+      </div>`
+    })}
+    ${fold({
+      id: 'card-outbound-limit',
+      icon: '🧯',
+      title: '安全上限',
+      sub: '滚动 1 小时最多发多少条',
+      val: `${esc(maxPerHour)} 条/小时`,
+      open: true,
+      body: `
+      <div class="field-row">
+        <div class="field"><label>每小时最多发送（条，0 = 不限）</label>
+          <input type="number" id="lim-maxperhour" min="0" step="1" value="${esc(maxPerHour)}" />
+          <div class="hint">全局安全保险丝：滚动 1 小时窗口，只计真正发成功到 QQ 的消息（失败/去重不计）；到顶后直接拒绝、不排队、不重试。</div></div>
+      </div>`
+    })}
+    ${fold({
+      id: 'card-context-budget',
+      icon: '💾',
+      title: '上下文预算',
+      sub: '每次响应带多少条已读历史',
+      val: `${esc(historyCount)} 条`,
+      open: false,
+      body: `
+      <div class="field-row">
+        <div class="field"><label>已读历史条数（80–500）</label>
+          <input type="number" id="pm-historycount" min="80" max="500" step="10" value="${esc(historyCount)}" />
+          <div class="hint">越大越贵。更细的裁剪（保留最近 N 条 / 字符预算）在「工具与技能 → 插件」页的 token-saver 里调。</div></div>
+      </div>`
+    })}
+  `;
+}
 
 function renderChatSection(c) {
   const st = c.store || {};

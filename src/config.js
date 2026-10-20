@@ -296,6 +296,24 @@ export const DEFAULT_CONFIG = {
       // "高峰窗口外一律 = 低谷"（peakWindowActive 只读 peak.start/end），
       // valley.start/end 是旧版死字段，loadConfig 时剔除。
       valley: { sliderPos: 100 }
+    },
+    // ── 参与策略（选择驱动，2026-10-20）──
+    // 一个字段决定"什么时候开口"，三种模式互斥（避免散落的开关各说各话）：
+    //   probability = 沿用响应滑条（档位 + 随机概率）—— 默认，兼容旧行为
+    //   ai          = 群聊非定向消息交给模型自己判断（正文 [[PASS]] = 这轮不接），见 aiJudge
+    //   directed    = 只在被 @ / 拍一拍 / 关键词命中 / 私聊时响应，无随机
+    participationMode: 'probability',
+    // ── AI 自动判断接话（participationMode='ai' 时生效）──
+    aiJudge: {
+      enabled: false,        // 与 participationMode='ai' 同步（前端切换模式时一起写）
+      passMarker: '[[PASS]]', // 模型只输出这个标记 = 这轮不接（核心在 rescue 之前识别）
+      minGapSec: 0           // 同群两次 AI 判定最小间隔（秒）；0 = 不限制
+    },
+    // ── 出站硬上限（安全保险丝）──
+    // 每**滚动** 1 小时真正发到 QQ 的消息条数上限（文本/图片/语音/提醒/@ 回复都算）。
+    // 0 = 不限。只计成功发送（失败/去重不计），全局共享，闸门在 SendQueue 唯一出口。
+    limits: {
+      maxMessagesPerHour: 2000
     }
   },
   // 屏蔽名单：{ [群号]: [QQ号, ...] }
@@ -383,6 +401,38 @@ export const DEFAULT_CONFIG = {
 };
 
 /** 深合并（含 __replace__ 整体替换约定）。导出供 routes.js 的预览端点做"不落盘的临时合并"。 */
+// ── 参与策略 / AI 判定：统一口径的读写辅助 ────────────────────────────────
+// 单一定义点：解析层（prompt.resolveContextTier）、系统提示（buildSystemPrompt）、
+// 核心短路（orchestrator）都从这里取，避免三处各写一遍"什么算 AI 模式"。
+
+export const PARTICIPATION_MODES = ['probability', 'ai', 'directed'];
+
+/** 参与策略白名单：未知/非法值一律回落 probability（旧行为）。 */
+export function normalizeParticipationMode(value) {
+  const mode = String(value ?? '').trim();
+  return PARTICIPATION_MODES.includes(mode) ? mode : 'probability';
+}
+
+/**
+ * 是否处于"AI 自动判断接话"模式。
+ *
+ * 两个来源（保持向后兼容）：
+ *   · participationMode === 'ai'（选择驱动的主口径）
+ *   · aiJudge.enabled === true（旧接口/单独开关，允许只写它）
+ * 前端切换模式时会把两者同步写；后端 sanitize 只做白名单与数值收敛，不强推导。
+ */
+export function isAiJudgeMode(store) {
+  const st = (store && typeof store === 'object') ? store : {};
+  if (normalizeParticipationMode(st.participationMode) === 'ai') return true;
+  return st.aiJudge?.enabled === true;
+}
+
+/** AI 判定用的"不接话"标记（空/非法回落 [[PASS]]，最长 32 字）。 */
+export function aiJudgePassMarker(store) {
+  const raw = String((store && typeof store === 'object' ? store.aiJudge?.passMarker : '') ?? '').trim();
+  return (raw || '[[PASS]]').slice(0, 32);
+}
+
 export function deepMerge(base, override) {
   if (override === null || override === undefined) return structuredClone(base);
   if (typeof base !== 'object' || base === null || Array.isArray(base)) return structuredClone(override);
@@ -607,6 +657,24 @@ export function updateConfig(patch) {
   // 磁盘上可能已经存过历史遗留的派生标记，一并清掉
   stripDerivedFlags(currentConfig);
   stripObsoleteFields(currentConfig);
+
+  // ── 参与策略 / AI 判定 / 出站硬上限：白名单与数值收敛 ──
+  // 前端只上报选择，非法值不许进入运行态（直接手改接口/旧配置都要落回安全默认）。
+  // 注意：participationMode 与 aiJudge.enabled 的同步由**前端切换模式时**完成
+  // （这里不强推导：允许只写 aiJudge.enabled 的旧接口用法，见 isAiJudgeMode）。
+  const storeNow = currentConfig.store = currentConfig.store || {};
+  storeNow.participationMode = normalizeParticipationMode(storeNow.participationMode);
+  const aiNow = (storeNow.aiJudge && typeof storeNow.aiJudge === 'object') ? storeNow.aiJudge : {};
+  storeNow.aiJudge = {
+    enabled: aiNow.enabled === true,
+    passMarker: (String(aiNow.passMarker ?? '').trim() || '[[PASS]]').slice(0, 32),
+    minGapSec: Math.max(0, Math.min(3600, Math.floor(Number(aiNow.minGapSec) || 0)))
+  };
+  const limitsNow = (storeNow.limits && typeof storeNow.limits === 'object') ? storeNow.limits : {};
+  const capNow = Number(limitsNow.maxMessagesPerHour);
+  storeNow.limits = {
+    maxMessagesPerHour: Number.isFinite(capNow) ? Math.max(0, Math.floor(capNow)) : 2000
+  };
 
   // ── 响应档位：以滑条位置为唯一真相，派生 tier 与随机概率 ──
   // 前端只负责上报滑条位置（contextSliderPos），档位和概率一律由这里换算。

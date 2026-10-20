@@ -10,7 +10,7 @@
 // 行为规则全部移植自 qq-bridge 的二代仿真 preset（qq-chat-v2），去掉了
 // 沉睡/唤醒/等待机制（由编排器的"已读/未读驱动"取代）。
 
-import { getConfig, personaForChat } from './config.js';
+import { getConfig, personaForChat, isAiJudgeMode, normalizeParticipationMode, aiJudgePassMarker } from './config.js';
 // 滑条换算放在独立模块（零依赖），避免 config.js ↔ prompt.js 循环依赖。
 // 这里 re-export 是为了让已经从 prompt.js 引用的代码不受影响。
 import { sliderToTier as _sliderToTier, tierToSlider as _tierToSlider, TIER_SLIDER_BANDS as _TIER_SLIDER_BANDS } from './tier-slider.js';
@@ -42,7 +42,7 @@ function toolProtocol() {
     '5. 看完消息决定不回，就安静结束。不回不需要理由，也不需要任何"收尾"动作。',
     '6. 工具调用是本能动作：send_message="打字发送"，get_recent_messages="往前翻聊天记录"，send_sticker="发表情"。内心不要写"我调用 xx 获取数据"这种伪代码。',
     '7. 【空格不是分句符号】QQ 消息里的空格会原样发送，真人不会用空格分句。想说两句就传数组，例如 ["在的","咋了"]。唯一可保留空格的是英文单词/数字之间的必要间隔（如 DeepSeek V3）。发送前自检：数组里每个字符串内部不应有用空格分隔的中文短句。',
-    '8. 【分条发送】普通对话默认 1 条，最多 2 条；只有讲故事、回忆、补刀时才 2~4 条。单条尽量短，多数 ≤30 字，不要小作文。'
+    '8. 【分条发送】普通对话默认 1 条，最多 2 条；只有讲故事、回忆、补刀时才 2~4 条。单条通常较短（多数 ≤30 字），但需要解释清楚时可以写完整、允许长回复；不要为了凑长度灌水，也不要该展开时硬压成一句。'
   ].join('\n');
 }
 
@@ -156,7 +156,7 @@ function qqSceneRules() {
   const search = cfg.webSearch?.enabled !== false;
   const lines = [
     '【QQ 场景规则】',
-    '- 回复保持简短，符合群友语感；不要使用 Markdown 格式（**、#、代码块在 QQ 上会显示成乱码）。',
+    '- 默认简短、符合群友语感；但有内容/需要解释时可以说完整、允许长回复 —— 不要为了凑长度灌水，也不要该展开时硬压成一句；不要使用 Markdown 格式（**、#、代码块在 QQ 上会显示成乱码）。',
     '- 私聊被直接找通常要回，但也不用秒回；群聊更松散。',
     '- 带「引用/回复」的消息（如 `[引用 某群友：原文]`）表示这句话是在回应被引用的人；引用对象不是你时别抢话；只有引用的是你自己的消息、或文字里明确 @/提到你，才需要回应。'
   ];
@@ -209,6 +209,24 @@ function renderSkillSections(sections) {
 }
 
 /** 组装系统提示。 */
+/**
+ * AI 自动判断接话的守则段（只在 AI 模式下注入，marker 来自配置）。
+ *
+ * 为什么必须"自动注入"：PASS 标记是核心与模型之间的**协议** —— 光在代码里识别
+ * 标记、不在提示词里告诉模型它存在，等于要求模型猜；而模型一旦不知道协议，
+ * 就会把 [[PASS]] 当普通文字或输出别的东西，核心短路永远不触发。
+ */
+function aiJudgeRules() {
+  const st = getConfig().store || {};
+  if (!isAiJudgeMode(st)) return '';
+  const marker = aiJudgePassMarker(st);
+  return [
+    '【群聊参与守则（自动判断）】你在群里，是否开口由你判断：大约每 10 条消息最多接 1 条；',
+    '只在有话说、能接梗、被问到你、或延续对话有意义时开口；不要每句都回、不要为存在感发言；被 @/点名/私聊时必须回应。',
+    `判断为「这轮不接」时，**只输出 ${marker}**（不要解释、不要道歉、不要调用任何工具、不要输出其它文字）；决定接话时按正常工具协议发消息。`
+  ].join('');
+}
+
 export function buildSystemPrompt({ persona, skillContext, extraSections = [] } = {}) {
   const cfg = persona ?? getConfig().persona;
   // extraSections：调用方在**运行时**算出来的片段（如主人身份说明）。
@@ -237,6 +255,8 @@ export function buildSystemPrompt({ persona, skillContext, extraSections = [] } 
       .replaceAll('{roleText}', String(cfg.roleText ?? ''))
       .replaceAll('{participation}', participationText(cfg.participation));
     const parts = [rendered, '', securityRules(), '', toolProtocol()];
+    const aiRules = aiJudgeRules();
+    if (aiRules) parts.push('', aiRules);
     parts.push(...renderSkillSections(skillSections));
     if (cfg.customRules && String(cfg.customRules).trim()) {
       parts.push('', '【管理员附加规则】', String(cfg.customRules).trim());
@@ -251,6 +271,7 @@ export function buildSystemPrompt({ persona, skillContext, extraSections = [] } 
     '',
     toolProtocol(),
     '',
+    ...(aiJudgeRules() ? [aiJudgeRules(), ''] : []),
     antiAiFlavor(),
     '',
     subjectivity(),
@@ -288,7 +309,7 @@ export function buildSystemPrompt({ persona, skillContext, extraSections = [] } 
 function participationText(level) {
   switch (String(level || 'medium')) {
     case 'low':
-      return '你的参与度风格：安静型。大部分时候潜水看戏，只在被 @/点名/直接提问、或确实有特别想说的时才开口；开口也简短。';
+      return '你的参与度风格：安静型。大部分时候潜水看戏，只在被 @/点名/直接提问、或确实有特别想说的时才开口；开口不拖沓，但该说清楚的会说完整。';
     case 'high':
       return '你的参与度风格：活跃型。热闹的群聊里可以比较活跃，能接的话题尽量接，偶尔主动开话题；但依然选择性接话，不要每条都回、不要刷屏。';
     default:
@@ -459,11 +480,7 @@ export function resolveContextTier({ triggerEntries = [], selfNickname = '', bot
     return { tier: 4, count: historyCount(), reason: '私聊消息', shouldRespond: true };
   }
 
-  // 注意：不能用 `Number(x) || 4` —— 0 是 falsy，会被误当成"未设置"回落到 4。
-  // 必须先判断是不是有效数字，再钳到 [1,4]。
-  const rawTier = Number(c.contextTier);
-  const tier = Number.isFinite(rawTier) ? Math.min(4, Math.max(1, Math.round(rawTier))) : 4;
-
+  // ── 三个触发信号（纯计算，三种参与策略共用同一份口径）──
   // 被艾特（2026-09-26）：**有 atMe 标记的条目以标记为准** —— 标记来自 @ 段的
   // QQ 号，能区分"同名不同人"（群友 @ 的人与机器人重名时不再误判为召唤）；
   // 无标记的老存档才回落到文本包含匹配（重名仍会误判，老数据的已知局限）。
@@ -474,6 +491,36 @@ export function resolveContextTier({ triggerEntries = [], selfNickname = '', bot
   // 关键词判定剔除 @ 片段：@ 别人的名字里带关键词不该触发（词表有"鱼"
   // ≠ 群友 @ 了"摸鱼小能手"）；正文里的关键词照常命中。
   const keyword = hitKeyword((triggerEntries || []).map((e) => stripMentions(e)).join('\n'), c.keywords);
+  // 拍一拍 = 轻量召唤：触发批里有"拍了拍我"的事件时按 1 档响应（与被艾特同级）。
+  // 判定依据是 isPoke 标记 + 文本里"拍了拍 我"（后者兜底老存档里没有标记的记录）。
+  const pokeMe = (triggerEntries || []).some((e) => e?.isPoke && /拍了拍\s*我/.test(String(e?.text ?? '')));
+
+  // ── 参与策略：选择驱动（2026-10-20）──
+  // probability = 下面的老逻辑（滑条档位 + 随机，默认）；ai = 群聊非定向交给模型判断；
+  // directed = 只回定向信号，不看滑条、无随机。
+  const mode = normalizeParticipationMode(c.participationMode);
+  if (mode === 'ai') {
+    // 定向信号仍然必回：被召唤不是"要不要插话"的判断题（也说明模型必须回应）。
+    if (pokeMe) return { tier: 1, count: historyCount(), reason: '拍了拍我', shouldRespond: true };
+    if (atMe) return { tier: 1, count: historyCount(), reason: '被艾特', shouldRespond: true };
+    // 群聊里其它消息：绕过滑条概率/关键词，全部交给模型自己判断
+    //（reason='AI 判定' 是核心短路 PASS 标记的依据之一）。
+    return { tier: 4, count: historyCount(), reason: 'AI 判定', shouldRespond: true };
+  }
+  if (mode === 'directed') {
+    if (pokeMe) return { tier: 1, count: historyCount(), reason: '拍了拍我', shouldRespond: true };
+    if (atMe) return { tier: 1, count: historyCount(), reason: '被艾特', shouldRespond: true };
+    if (keyword) return { tier: 2, count: historyCount(), reason: '关键词命中', shouldRespond: true };
+    // 仅定向：没有随机、没有"全部响应"，滑条不参与判定
+    return { tier: 0, count: 0, reason: '未触发（仅定向）', shouldRespond: false };
+  }
+
+  // ── probability：原有滑条档位逻辑（逐字节保持）──
+  // 注意：不能用 `Number(x) || 4` —— 0 是 falsy，会被误当成"未设置"回落到 4。
+  // 必须先判断是不是有效数字，再钳到 [1,4]。
+  const rawTier = Number(c.contextTier);
+  const tier = Number.isFinite(rawTier) ? Math.min(4, Math.max(1, Math.round(rawTier))) : 4;
+
   // 掷骰子：调用方可传入已固定的 roll（0-100），避免重复随机。
   // ⚠️ 同一批消息的预判（#predictTier）与实跑（wake 里的 tierResult）各掷一次
   //    是刻意的 —— 防抖窗口里预判"会响应"创建了等待会话，窗口结束实跑重新掷
@@ -483,8 +530,6 @@ export function resolveContextTier({ triggerEntries = [], selfNickname = '', bot
   const randomHit = rollValue < Math.max(0, Math.min(100, Number(c.randomPercent) || 0));
 
   // 拍一拍 = 轻量召唤：触发批里有"拍了拍我"的事件时按 1 档响应（与被艾特同级）。
-  // 判定依据是 isPoke 标记 + 文本里"拍了拍 我"（后者兜底老存档里没有标记的记录）。
-  const pokeMe = (triggerEntries || []).some((e) => e?.isPoke && /拍了拍\s*我/.test(String(e?.text ?? '')));
   if (pokeMe) {
     return { tier: 1, count: historyCount(), reason: '拍了拍我', shouldRespond: true };
   }
