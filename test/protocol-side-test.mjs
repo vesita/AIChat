@@ -328,12 +328,21 @@ async function main() {
     assert.equal(actions.length, 1);
     assert.deepEqual(actions[0].args, ['--user', 'restart', 'napcat.service']);
   });
-  await checkAsync('XDG_RUNTIME_DIR：进程 env 有值时优先用它（不被 uid 兜底覆盖）', async () => {
+  await checkAsync('XDG_RUNTIME_DIR：与进程 uid 不一致的 env 值**不被采信**（系统单元的 %U 陷阱）', async () => {
+    // 现场实测：`Environment=XDG_RUNTIME_DIR=/run/user/%U` 在系统单元里展开成 /run/user/0，
+    // 采信它会让所有 systemctl --user 调用连到不存在的 manager。权威来源必须是进程 uid。
     const stub = createStubRunner();
-    const side = makeSide({ stub, env: { XDG_RUNTIME_DIR: '/run/user/4242' }, getuid: () => 1000 });
+    const side = makeSide({ stub, env: { XDG_RUNTIME_DIR: '/run/user/0' }, getuid: () => 1000 });
     await side.start();
-    assert.equal(stub.actionCalls()[0].env.XDG_RUNTIME_DIR, '/run/user/4242');
-    assert.equal(side.xdgRuntimeDir(), '/run/user/4242');
+    assert.equal(stub.actionCalls()[0].env.XDG_RUNTIME_DIR, '/run/user/1000');
+    assert.equal(side.xdgRuntimeDir(), '/run/user/1000');
+  });
+  await checkAsync('XDG_RUNTIME_DIR：与进程 uid 一致的 env 值原样沿用', async () => {
+    const stub = createStubRunner();
+    const side = makeSide({ stub, env: { XDG_RUNTIME_DIR: '/run/user/1000' }, getuid: () => 1000 });
+    await side.start();
+    assert.equal(stub.actionCalls()[0].env.XDG_RUNTIME_DIR, '/run/user/1000');
+    assert.equal(side.xdgRuntimeDir(), '/run/user/1000');
   });
   await checkAsync('XDG_RUNTIME_DIR：进程 env 没有时按 /run/user/<uid> 补', async () => {
     const stub = createStubRunner();

@@ -163,13 +163,21 @@ export function createProtocolSide(deps = {}) {
   /** 动作成功：代表现场已按用户意图变化，任何旧失败记录都可以清掉。 */
   function clearLastError() { lastError = ''; lastErrorSource = ''; }
 
-  /** I4 唯一构造点：systemctl --user 必须显式指向部署用户的 runtime dir。 */
+  /**
+   * I4 唯一构造点：systemctl --user 必须显式指向部署用户的 runtime dir。
+   *
+   * 权威来源是**进程自己的 uid**（本服务以部署用户身份运行，getuid() 就是它）。
+   * 环境变量只在它与该 uid 一致时才采信 —— 系统单元里写
+   * `Environment=XDG_RUNTIME_DIR=/run/user/%U` 会展开成 `/run/user/0`（%U 是服务管理器的 uid，
+   * 系统管理器恒为 0），那是个不存在且无权限的目录，采信它会让所有 systemctl --user 调用失败。
+   * 现场实测踩过这个坑（2026-10-20）。
+   */
   function xdgRuntimeDir() {
-    const fromEnv = String(env?.XDG_RUNTIME_DIR || '').trim();
-    if (fromEnv) return fromEnv;
     let uid = 0;
     try { uid = Number(getuid()); } catch { uid = 0; }
-    return `/run/user/${Number.isFinite(uid) ? uid : 0}`;
+    const expected = `/run/user/${Number.isFinite(uid) ? uid : 0}`;
+    const fromEnv = String(env?.XDG_RUNTIME_DIR || '').trim();
+    return fromEnv === expected ? fromEnv : expected;
   }
 
   function runnerEnv() {
