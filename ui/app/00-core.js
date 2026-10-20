@@ -597,10 +597,24 @@ function cycleTheme() {
     .catch(() => { /* 后端不可达时静默：localStorage 已经生效 */ });
 }
 
+// ── 控制台挂载基路径 ──────────────────────────────────────────────────────
+// 控制台可能直接挂在站点根（"/"），也可能被反向代理挂在子路径下（例如
+// AccessTrust 数据面的 "/aichat/"）。document.baseURI 取自页面自身 URL，
+// 两种入口下算出的基路径都正确：根挂载是 "/"，前缀挂载是 "/aichat/"。
+// 所有以 "/" 开头的同源 URL 都必须经它改写 —— 否则浏览器会绕过代理前缀去
+// 打站点根，而服务端只在剥掉前缀后才看到 "/api/*"。
+// （document.baseURI 在真实浏览器里恒有；测试桩的假 document 没有它，退回 location.href。）
+const CONSOLE_BASE = new URL('.', document.baseURI || location.href).pathname;
+
+/** 把以 "/" 开头的同源路径解析到控制台基路径；其它路径原样返回。 */
+function consoleUrl(path) {
+  return path.startsWith('/') ? CONSOLE_BASE + path.slice(1) : path;
+}
+
 async function api(path, options = {}) {
   // keepalive 由调用方按需传（配置保存的 POST 用它：页面卸载后请求仍能完成）
   const { keepalive, ...rest } = options;
-  const res = await fetch(path, {
+  const res = await fetch(consoleUrl(path), {
     headers: {
       'content-type': 'application/json',
       'x-console-token': CONSOLE_MARKER,

@@ -1170,17 +1170,27 @@ export function createApp({ log = console.log } = {}) {
 
   function originAllowed(req) {
     const host = String(req.headers.host ?? '');
+    // 经 AccessTrust 数据面反代过来时，Host 已被剥掉并改写成回环地址，浏览器侧的真实
+    // authority 只剩 Caddy 加的 X-Forwarded-Host。这里把「有效 authority」定成：
+    // 有非空 X-Forwarded-Host 就用它，否则用 Host —— 所以经 AT 的请求按浏览器看到的
+    // host 校验，浏览器直连 127.0.0.1 时仍按 Host 校验（恶意网页带不出这个头：跨域带
+    // 自定请求头会先触发 CORS 预检，本服务不放行预检，请求发不出去）。
+    const forwardedHost = String(req.headers['x-forwarded-host'] ?? '');
+    const authority = forwardedHost || host;
+    // 无论如何 Host 必须是回环：进程只监听回环，Host 不是回环说明是 DNS rebinding
+    // （此时 Origin 与攻击者域名同源，光靠下面的 authority 比对拦不住）。
+    // 经 AT 时 Host 已被改写成回环，不挡正常链路。
     if (!isLoopbackHostHeader(host)) return false;
     const origin = String(req.headers.origin ?? '');
     if (origin) {
       try {
         const u = new URL(origin);
-        return isLoopbackHostHeader(u.host) && u.host === host;
+        return u.host === authority;
       } catch { return false; }
     }
     const referer = String(req.headers.referer ?? '');
     if (referer) {
-      try { return new URL(referer).host === host; } catch { return false; }
+      try { return new URL(referer).host === authority; } catch { return false; }
     }
     // 无来源信息（curl / 本机脚本 / 地址栏直达）—— 放行
     return true;

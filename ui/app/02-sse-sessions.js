@@ -2,7 +2,7 @@
 'use strict';
 // ── SSE ──
 function connectSSE() {
-  const es = new EventSource('/api/events');
+  const es = new EventSource(consoleUrl('/api/events'));
   es.addEventListener('session-start', () => {
     scheduleListReload();
     refreshStatus();
