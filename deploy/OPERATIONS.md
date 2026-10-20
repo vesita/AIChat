@@ -87,5 +87,28 @@ PY
 
 ```bash
 curl -X POST http://127.0.0.1:3210/api/config \
-  -H 'content-type: application/json' -d '{"wakeTierPos":15}'
+  -H 'content-type: application/json' -d '{"store":{"contextSliderPos":15}}'
 ```
+
+`wakeTierPos` 是**废弃字段**（全仓没有读点），传它不会生效；真正的开关是 `store.contextSliderPos`。
+
+## 人设：两层各管什么
+
+- **roleText**（`src/personas.js`）：身份 + 硬边界，约 350 字，每轮注入用户提示【角色设定】。
+  ⚠️ 线上生效的是 `data/config.json` 里的 `persona.roleText`：**改代码里的默认值只影响全新安装**，
+  已有部署要 `POST /api/config` 把新文本写进去（或从新代码取 `PERSONAS.xiaojingyu.text` 再 POST），
+  否则看到的还是旧角色卡。
+- **systemPromptOverride**（`deploy/personas/xiaojingyu-friendly.md`）：语气、开口、例子、自检。
+  用 `bash deploy/apply-persona.sh` 注入；脚本会先备份到 `data/persona-backup-*.json` 再验证。
+- 两层**不要重复写同一件事**（机制类内容由 `toolProtocol()` 等承担）；重复会被同时注入，既浪费 token 又互相打架。
+
+## 自带插件（`plugins/`，确定性型）
+
+| 插件 | 提供 | 默认 | 开关 |
+|---|---|---|---|
+| `smart-wake` | `reply.interest-judge` | 技能已启用，但**行为开关 `enabled=false`** | `POST /api/skills/smart-wake -d '{"settings":{"enabled":true}}'` |
+| `token-saver` | `reply.local-policy`、`before-llm-messages`、`llm.usage` | 历史裁剪开（`keepLast=40`、`charBudget=12000`）；**收尾策略 `localPolicy=false`** | `POST /api/skills/token-saver -d '{"settings":{...}}'` |
+
+`smart-wake` 打开后会在「核心判定说不接」时用本地启发式决定要不要接（问句/延续对话加分，刷屏/复读/命令抑制，
+每群 90s 冷却、每小时 12 条/每天 60 条上限）；觉得变吵就调高 `escalateThreshold` 或关 `settings.enabled`。
+`token-saver` 的 `before-llm-messages` 只裁【已读信息】最旧部分，不碰未读/当前触发批/工具消息。
