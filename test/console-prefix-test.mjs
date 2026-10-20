@@ -11,6 +11,8 @@
 //   3. ui/app/00-core.js 的 api() 经基路径解析以 "/" 开头的 path
 //   4. ui/app/02-sse-sessions.js 的 EventSource 不再写死 /api/events
 //   5. ui/app/10-feedback.js 的 Service Worker 按基路径注册（scope 落在前缀下）
+//   6. src/app.js 的 originAllowed() 有 x-forwarded-proto 网关标记分支（经 AT 放行，
+//      且不再错误地拿 x-forwarded-host 当有效 authority）
 //
 // 运行：node test/console-prefix-test.mjs（已接入 npm test）
 import fs from 'node:fs';
@@ -126,6 +128,21 @@ check('10-feedback.js 的 serviceWorker.register 按基路径注册', () => {
   assert(!raw, `仍有写死的 register('/captcha-sw.js')：${raw && raw[0]}`);
   const ok = /serviceWorker\.register\s*\(\s*consoleUrl\(\s*['"]\/captcha-sw\.js['"]\s*\)\s*\)/.test(feedback);
   assert(ok, "register 参数应形如 register(consoleUrl('/captcha-sw.js'))");
+});
+
+// ── 6. src/app.js：originAllowed 必须有网关标记分支 ────────────────────────
+check('src/app.js 的 originAllowed() 有 x-forwarded-proto 网关分支（且早于 Host 校验）', () => {
+  const server = read('src/app.js');
+  const body = functionBody(server, 'function originAllowed(req)');
+  const gateway = body.indexOf("req.headers['x-forwarded-proto']");
+  assert(gateway >= 0, 'originAllowed() 缺少 x-forwarded-proto 网关标记分支（AT 转发来的请求会 403）');
+  const hostCheck = body.indexOf('req.headers.host');
+  assert(hostCheck > gateway, '网关分支必须在 Host 校验之前：经 AT 时 Host 是 AT 自己的回环地址');
+  assert(/if\s*\(\s*gatewayProto\s*\)\s*return true/.test(body), '网关分支必须直接放行（return true）');
+  assert(
+    !body.includes("req.headers['x-forwarded-host']"),
+    '不要再拿 x-forwarded-host 当有效 authority：AT 的 forward() 会用自己收到的 Host 覆盖它，实测必然 403'
+  );
 });
 
 if (failed === 0) {

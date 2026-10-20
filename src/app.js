@@ -1161,7 +1161,8 @@ export function createApp({ log = console.log } = {}) {
   // ── 来源校验（CSRF / DNS rebinding 防护）────────────────────────────────
   // 服务只监听回环，但**浏览器里的任意网页都能向 127.0.0.1 发简单请求**，
   // 而 CORS 只挡"读响应"、挡不住"副作用"（改配置、暂停、重置数据…）。
-  // 所以所有 /api/* 都必须来自回环 Host；带 Origin/Referer 时必须同源。
+  // 所以直连请求：Host 必须是回环（防 DNS rebinding），带 Origin/Referer 时必须同源。
+  // 经 AccessTrust 数据面转发的请求按「网关标记头」识别后放行，见 originAllowed()。
   function isLoopbackHostHeader(host) {
     return /^127\.0\.0\.1(:\d+)?$/.test(host)
       || /^localhost(:\d+)?$/.test(host)
@@ -1169,28 +1170,35 @@ export function createApp({ log = console.log } = {}) {
   }
 
   function originAllowed(req) {
+    // ── 网关链路标记 ──────────────────────────────────────────────────────
+    // AccessTrust 数据面转发时会**无条件**补这组头（accesstrust/backend/src/
+    // gateway/data_plane.rs 的 forward()）：x-forwarded-proto: "https"，以及
+    // x-real-ip / x-forwarded-for（客户端 IP）。浏览器伪造不出来 —— 跨域带自定义
+    // 请求头会先触发 CORS 预检，而本服务不接 CORS（预检必失败）；no-cors 模式下
+    // 自定义头会被浏览器直接丢弃。本机进程能伪造这组头，但本机进程在可信边界内：
+    // 服务只监听 127.0.0.1，能直连它的本机进程本来就能改配置/读数据。
+    //
+    // 为什么不比对 X-Forwarded-Host：AT 的 forward() 会用它**自己收到的 Host** 覆盖
+    // x-forwarded-host，而 Caddy 反代到 AT 时 Host 已被改写成 127.0.0.1:9800 ——
+    // 这个值永远不等于浏览器 Origin 的主机名，拿它比对必然 403（实测真实链路）。
+    const gatewayProto = String(req.headers['x-forwarded-proto'] ?? '');
+    if (gatewayProto) return true;
+
+    // ── 直连 / 非网关链路：按 Host + 来源校验（CSRF / DNS rebinding 防线）──
     const host = String(req.headers.host ?? '');
-    // 经 AccessTrust 数据面反代过来时，Host 已被剥掉并改写成回环地址，浏览器侧的真实
-    // authority 只剩 Caddy 加的 X-Forwarded-Host。这里把「有效 authority」定成：
-    // 有非空 X-Forwarded-Host 就用它，否则用 Host —— 所以经 AT 的请求按浏览器看到的
-    // host 校验，浏览器直连 127.0.0.1 时仍按 Host 校验（恶意网页带不出这个头：跨域带
-    // 自定请求头会先触发 CORS 预检，本服务不放行预检，请求发不出去）。
-    const forwardedHost = String(req.headers['x-forwarded-host'] ?? '');
-    const authority = forwardedHost || host;
-    // 无论如何 Host 必须是回环：进程只监听回环，Host 不是回环说明是 DNS rebinding
-    // （此时 Origin 与攻击者域名同源，光靠下面的 authority 比对拦不住）。
-    // 经 AT 时 Host 已被改写成回环，不挡正常链路。
+    // Host 必须是回环：进程只监听回环，Host 不是回环说明是 DNS rebinding
+    // （此时 Origin 与攻击者域名同源，光靠下面的 origin 比对拦不住）。
     if (!isLoopbackHostHeader(host)) return false;
     const origin = String(req.headers.origin ?? '');
     if (origin) {
       try {
         const u = new URL(origin);
-        return u.host === authority;
+        return isLoopbackHostHeader(u.host) && u.host === host;
       } catch { return false; }
     }
     const referer = String(req.headers.referer ?? '');
     if (referer) {
-      try { return new URL(referer).host === authority; } catch { return false; }
+      try { return new URL(referer).host === host; } catch { return false; }
     }
     // 无来源信息（curl / 本机脚本 / 地址栏直达）—— 放行
     return true;
