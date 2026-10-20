@@ -24,6 +24,10 @@ WorkingDirectory=/opt/aichat/app
 Environment=QQ_AGENT_DATA_DIR=/var/lib/aichat/data
 Environment=QQ_AGENT_PORT=3210
 Environment=NODE_ENV=production
+# 时区：进程里所有「给人看 / 给模型看」的时间都走本地时区（src/util.js）。
+# 宿主默认 UTC，不指定就整体慢 8 小时 —— 注入提示词的【当前时间】、消息时间戳、
+# 日志时间、峰谷时段、提醒解析、按日分桶统统受影响。这里固定北京时间。
+Environment=TZ=Asia/Shanghai
 # 等 OneBot HTTP 就绪再起：最多等 180 秒，超时就让本次启动失败、交给 Restart 重试。
 # 这样 NapCat 慢一拍时不会出现「起了但连不上、之后再也不重连」的僵局。
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 180); do curl -sf -m 2 -o /dev/null http://127.0.0.1:3002/get_login_info && exit 0; sleep 1; done; echo "OneBot 180 秒内未就绪" >&2; exit 1'
