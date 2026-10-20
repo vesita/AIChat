@@ -1,0 +1,34 @@
+{
+  "id": "smart-wake",
+  "name": "智能唤醒判定",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "message",
+  "description": "用本地启发式提供 reply.interest-judge：抑制刷屏/复读/命令/超短消息，命中问句或延续对话时主动接话。纯本地，零网络、零磁盘，状态只在内存。",
+  "enabledByDefault": true,
+  "capabilities": ["reply.interest-judge"],
+  "settings": {
+    "enabled": false,
+    "threshold": 4,
+    "escalateThreshold": 5,
+    "minChars": 6,
+    "cooldownSec": 90,
+    "hourlyCap": 12,
+    "dailyCap": 60,
+    "continuationSec": 120,
+    "repeatWindow": 12,
+    "suppressSpam": true
+  },
+  "configSchema": {
+    "enabled": { "type": "boolean", "label": "启用智能唤醒", "description": "默认关闭：会改变“要不要接话”的行为。打开后本插件才会对触发判定给出意见。" },
+    "threshold": { "type": "number", "label": "接话阈值（兜底）", "description": "escalateThreshold 未配置时用它作为主动接话阈值。" },
+    "escalateThreshold": { "type": "number", "label": "主动接话阈值", "description": "核心判定不触发时，启发式分数达到该值才接话（默认 5：问句 +3、延续对话 +2 即可）。" },
+    "minChars": { "type": "number", "label": "最短字数", "description": "低于该字数的消息按“超短消息”抑制（默认 6）。" },
+    "cooldownSec": { "type": "number", "label": "冷却秒数", "description": "同一会话接话后，多少秒内不再接话（默认 90）。" },
+    "hourlyCap": { "type": "number", "label": "每小时上限", "description": "每个会话每小时最多接话次数（默认 12）。" },
+    "dailyCap": { "type": "number", "label": "每日上限", "description": "每个会话每天最多接话次数（默认 60）。" },
+    "continuationSec": { "type": "number", "label": "延续对话窗口（秒）", "description": "最近这么多秒内机器人说过话，则当前消息视为延续对话加分（默认 120）。" },
+    "repeatWindow": { "type": "number", "label": "复读检测窗口（条）", "description": "在最近这么多条消息里找相同文本，判定复读（默认 12）。" },
+    "suppressSpam": { "type": "boolean", "label": "抑制刷屏", "description": "开启后纯表情/复读/命令/超短消息会被判定为不该接话（默认开启）。" }
+  }
+}

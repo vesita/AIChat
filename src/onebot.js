@@ -419,6 +419,123 @@ export function forwardIdFromData(d) {
  * onebot: OneBot 客户端，仅语音转写需要（`media.transcribe` 取语音文件用）；
  *         不传则语音保持 `[语音]` 占位。
  */
+// ── 卡片消息解析（json / xml 段）───────────────────────────────────────────
+//
+// 背景：QQ 的分享卡片（B站/公众号/小程序）在 OneBot 里是 json / xml 段，
+// 只打 [卡片消息] / [xml] 的话模型完全不知道群友发了什么，也无从回应
+// （"这个视频好看"接不上话）。这里把卡片里的标题/描述/链接/来源展开成一行文本。
+//
+// 设计约束：
+//   · 纯本地、零网络、绝不抛异常 —— 卡片是第三方内容，任何解析失败都回落原占位符；
+//   · 字段单项截断到 120 字：卡片描述可能是整篇文章，原样塞进提示词会把上下文吃光；
+//   · 能力优先：`message.card-text` 有提供者（插件）就先用它，返回非法/抛错/超时
+//     回落内置解析 —— 保证"装了坏插件"与"没装插件"行为一致。
+
+const CARD_FIELD_MAX = 120;
+
+/** 卡片字段截断：压平空白 + 单项 ≤120 字（超长加省略号）。 */
+function clipCardField(value) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > CARD_FIELD_MAX ? `${text.slice(0, CARD_FIELD_MAX)}…` : text;
+}
+
+/** 卡片 JSON 载荷 → 可读文本；解析不出来返回 null（调用方回落 [卡片消息]）。 */
+export function cardTextFromJson(raw) {
+  try {
+    let payload = raw;
+    if (typeof payload === 'string') payload = JSON.parse(payload);
+    if (!payload || typeof payload !== 'object') return null;
+    const meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
+    // detail_1 = 分享卡片/小程序（NapCat 实测形状）；news = 公众号图文；
+    // 其余实现见 meta.* 里第一个对象 —— 字段名一致时照样能读，不认识的形状返回 null。
+    const detail = meta.detail_1 || meta.news
+      || Object.values(meta).find((v) => v && typeof v === 'object' && !Array.isArray(v));
+    if (!detail || typeof detail !== 'object') return null;
+    const title = clipCardField(detail.title || detail.prompt || '');
+    // 预览图 URL 不当描述用：desc/summary 都没有时才退到 preview（部分卡片只有它）。
+    const desc = clipCardField(detail.desc || detail.summary || detail.preview || '');
+    const url = clipCardField(detail.url || detail.qqdocurl || detail.jumpUrl || detail.jump_url || '');
+    const source = clipCardField(detail.source || detail.tag || detail.app || payload.app || '');
+    const parts = [title, desc, url, source].filter(Boolean);
+    return parts.length ? `[卡片: ${parts.join('｜')}]` : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 解 XML 实体（卡片 XML 里的标题/描述都是转义过的）。 */
+function decodeXmlEntities(text) {
+  return String(text ?? '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+/** 卡片 XML 载荷 → 可读文本；解析不出来返回 null（调用方回落 [xml]）。 */
+export function cardTextFromXml(raw) {
+  try {
+    const xml = String(raw ?? '');
+    if (!xml.trim()) return null;
+    const pickTag = (name) => {
+      const m = new RegExp(`<${name}[^>]*>([\\s\\S]*?)</${name}>`, 'i').exec(xml);
+      return m ? clipCardField(decodeXmlEntities(m[1])) : '';
+    };
+    const title = pickTag('title');
+    const summary = pickTag('summary');
+    const url = pickTag('url');
+    let source = '';
+    const sourceTag = /<source[^>]*\bname=["']([^"']+)["']/i.exec(xml);
+    if (sourceTag) source = clipCardField(decodeXmlEntities(sourceTag[1]));
+    const parts = [title, summary, url, source].filter(Boolean);
+    return parts.length ? `[卡片: ${parts.join('｜')}]` : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 内置卡片解析（json / xml 段）；其它类型返回 null。 */
+export function cardTextBuiltin(seg) {
+  const type = String(seg?.type || '');
+  const data = seg?.data ?? {};
+  if (type === 'json') return cardTextFromJson(data.data ?? data);
+  if (type === 'xml') return cardTextFromXml(data.data ?? data.xml ?? '');
+  return null;
+}
+
+/**
+ * 能力优先的卡片解析：`message.card-text` 提供者 → 内置解析。
+ *
+ * 返回 null 时调用方用原占位符（[卡片消息] / [xml]），与未装插件完全一致。
+ */
+export async function cardTextFromSegment(seg) {
+  try {
+    const fn = skillManager.getCapabilityProviders('message.card-text')[0]?.fn;
+    if (fn) {
+      let timer = null;
+      let r;
+      try {
+        r = await Promise.race([
+          Promise.resolve().then(() => fn({ segment: seg })),
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve(undefined), 200);
+            timer.unref?.();
+          })
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      if (typeof r === 'string' && r.trim()) return r.trim();
+    }
+  } catch {
+    // 插件抛错 = 用内置解析（与"没装插件"一致）
+  }
+  return cardTextBuiltin(seg);
+}
+
 export async function segmentsToText(segments, { resolveReply = null, resolveAtName = null, includeReply = true, onebot = null, onAt = null } = {}) {
   if (typeof segments === 'string') return sanitizeUserText(segments.trim());
   const out = [];
@@ -476,7 +593,8 @@ export async function segmentsToText(segments, { resolveReply = null, resolveAtN
         out.push(replyText || '[引用消息]');
         break;
       }
-      case 'json': out.push('[卡片消息]'); break;
+      case 'json': out.push((await cardTextFromSegment(seg)) ?? '[卡片消息]'); break;
+      case 'xml': out.push((await cardTextFromSegment(seg)) ?? '[xml]'); break;
       case 'forward': {
         // 不带 res_id：那个 id 会过期（payload is empty），打出来只会误导模型拿它当参数。
         // 模型要看内容用 read_forward 工具 + 消息前的 #数字。

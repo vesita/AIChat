@@ -20,6 +20,17 @@ import { skillManager } from './skills/manager.js';
 import { getToolAvailability } from './tool-registry.js';
 import { rescueUnsentReply } from './reply-rescue.js';
 
+/**
+ * 触发判定扩展点（reply.interest-judge）的单次咨询超时。
+ *
+ * 判定发生在 ingest / wake 的关键路径上：慢插件不能拖住消息入库（ingest 是
+ * 串行热路径，每条消息都要过判定）或唤醒。超时与抛错一律回退核心自己的判定，
+ * 所以 300ms 是"最多多等这么久"，不是"必须等满"。
+ */
+const WAKE_JUDGE_TIMEOUT_MS = 300;
+/** 超时哨兵：与插件合法返回（对象）区分开。 */
+const WAKE_JUDGE_TIMEOUT = Symbol('wake-judge-timeout');
+
 export class Orchestrator {
   constructor({ store, memory, stickers, sender, sessions, onebot, emit = null, reminders = null, videoReader = null }) {
     this.store = store;
@@ -176,34 +187,194 @@ export class Orchestrator {
     if (!String(cfg.api.model || '').trim()) return;
     // 活跃期内的群：必响应，视作触发（与旧版"跳过判定"语义一致）
     const active = this.#activeState(chatKey);
-    if (!active) {
-      const tierResult = resolveContextTier({
-        triggerEntries: entry ? [entry] : (this.store.peekUnread(chatKey, 1) || []),
-        selfNickname: cfg.persona?.selfNickname || this.onebot.selfNickname || '',
-        botName: cfg.persona?.botName || '',
-        selfId: cfg.onebot?.selfId || this.onebot.selfId || '',
-        cfg: storeConfigForChat(chatKey),
-        isPrivate: String(chatKey).startsWith('private:'),
-        // 单条判定当场掷骰、当场出结果 —— 没有"预判/实跑"两阶段了，
-        // 骰子结果由 resolveContextTier 的 reason 带回（含当时的值）。
-        roll: null
-      });
-      if (!tierResult.shouldRespond) {
-        // 不触发：这条消息立即标已读（只标这一条，不动窗口外已积压的未读——
-        // 那些是上一批遗留，由兜底定时器/下一次触发处理）。
-        if (entry) {
-          this.store.markEntryRead(chatKey, entry.id);
-        } else {
-          this.store.markAllRead(chatKey);
-        }
-        this.emit('chat-update', chatKey);
-        return;
-      }
+    if (active) {
+      // 触发：进入固定的"等待中"倒计时（不重置）。verified 标记让 wake 知道
+      // 这一批是"逐条判定出过触发消息"的，批边界可以信任等待会话的起点。
+      this.scheduleWake(chatKey, null, { verified: true });
+      return;
     }
 
-    // 触发：进入固定的"等待中"倒计时（不重置）。verified 标记让 wake 知道
-    // 这一批是"逐条判定出过触发消息"的，批边界可以信任等待会话的起点。
-    this.scheduleWake(chatKey, null, { verified: true });
+    const base = resolveContextTier({
+      triggerEntries: entry ? [entry] : (this.store.peekUnread(chatKey, 1) || []),
+      selfNickname: cfg.persona?.selfNickname || this.onebot.selfNickname || '',
+      botName: cfg.persona?.botName || '',
+      selfId: cfg.onebot?.selfId || this.onebot.selfId || '',
+      cfg: storeConfigForChat(chatKey),
+      isPrivate: String(chatKey).startsWith('private:'),
+      // 单条判定当场掷骰、当场出结果 —— 没有"预判/实跑"两阶段了，
+      // 骰子结果由 resolveContextTier 的 reason 带回（含当时的值）。
+      roll: null
+    });
+    const info = this.#wakeJudgeInfo({
+      chatKey,
+      base,
+      triggerEntries: entry ? [entry] : (this.store.peekUnread(chatKey, 1) || []),
+      proactive: false
+    });
+    // 没有可咨询的插件 / 本来就不该咨询（私聊、被艾特、拍了拍我）：
+    // 完全同步地走原路径 —— 行为与时序（未读"一闪即已读"）都与没有扩展点时一致。
+    if (!this.#capFirst('reply.interest-judge', {}) || !this.#judgeEligible(base, info)) {
+      this.#applyIncomingDecision(chatKey, entry, base);
+      return;
+    }
+    // 有插件：异步咨询（≤300ms，超时/非法返回/抛错一律回退 base），出结果后再落闸门。
+    this.#applyIncomingDecisionAsync(chatKey, entry, base, info).catch((error) => {
+      console.error(`[orchestrator] ${chatKey} 触发判定插件异常，已按核心判定处理:`, error);
+    });
+  }
+
+  // ── 触发判定扩展点（reply.interest-judge）───────────────────────────────
+  //
+  // 三个判定点统一走 #refineWakeDecision：onIncoming（逐条触发判定）、
+  // wake 里的机械批补判定、wake 的最终档位判定。规则见 #refineWakeDecision。
+  //
+  // 为什么是一个 helper 而不是三处各写一遍：三处的失败语义（无提供者/非法返回/
+  // 抛错/超时）必须一致 —— 任何一处漏了 fail-open，就会出现"装了个坏插件，
+  // 消息全部不响应"这种最难排查的故障。
+
+  /** 落闸门：触发 → 排定唤醒；不触发 → 标已读（只标这一条）。 */
+  #applyIncomingDecision(chatKey, entry, decision) {
+    if (decision?.shouldRespond) {
+      this.scheduleWake(chatKey, null, { verified: true });
+      return;
+    }
+    // 不触发：这条消息立即标已读（只标这一条，不动窗口外已积压的未读——
+    // 那些是上一批遗留，由兜底定时器/下一次触发处理）。
+    if (entry) {
+      this.store.markEntryRead(chatKey, entry.id);
+    } else {
+      this.store.markAllRead(chatKey);
+    }
+    this.emit('chat-update', chatKey);
+  }
+
+  /** 异步判定版落闸门：咨询插件后再落闸门（咨询期间现场可能已变，重新过闸门）。 */
+  async #applyIncomingDecisionAsync(chatKey, entry, base, info) {
+    const decision = await this.#refineWakeDecision(base, info);
+    if (this.paused || this.aborted) return;
+    // 咨询期间可能已经排定了唤醒（后续消息走了同步/更快的判定）——
+    // 与同步路径同语义：倒计时中不再逐条判定，交给聚批。
+    if (this.runningChats.has(chatKey) || this.pendingWake.has(chatKey)) return;
+    this.#applyIncomingDecision(chatKey, entry, decision);
+  }
+
+  /**
+   * 这次判定该不该咨询插件。
+   *
+   * 私聊 / 被艾特 / 拍了拍我 = 核心已确定"这是直接召唤"，不是"要不要接话"的
+   * 判断题：插件最多能把它降级成"不响应"，那等于让插件吃掉召唤，绝不允许。
+   */
+  #judgeEligible(base, info) {
+    if (info?.kind === 'private') return false;
+    const reason = String(base?.reason || '');
+    return reason !== '私聊消息' && reason !== '被艾特' && reason !== '拍了拍我';
+  }
+
+  /** 组装修正判定插件要的现场信息（契约见 doc/extend_development/skill-reference.md）。 */
+  #wakeJudgeInfo({ chatKey, base, triggerEntries = [], proactive = false, sessionId = null, chatName = '' } = {}) {
+    const cfg = getConfig();
+    const [kind, chatId] = String(chatKey).split(':');
+    return {
+      base: {
+        tier: Number(base?.tier) || 0,
+        reason: String(base?.reason || ''),
+        shouldRespond: base?.shouldRespond === true,
+        count: Math.max(0, Number(base?.count) || 0)
+      },
+      chatKey,
+      kind,
+      chatId,
+      chatName: chatName || this.chatNameCache.get(chatId) || '',
+      model: cfg.api?.model || '',
+      provider: cfg.api?.provider || '',
+      visionEnabled: cfg.api?.vision !== false && modelImageVerdict(cfg.api?.provider, cfg.api?.model) !== 'no-vision',
+      searchEnabled: cfg.webSearch?.enabled !== false,
+      proactive: proactive === true,
+      sessionId: sessionId || null,
+      triggerEntries: (triggerEntries || []).slice(0, 30),
+      recent: this.#recentForJudge(chatKey),
+      botName: cfg.persona?.botName || '',
+      selfNickname: cfg.persona?.selfNickname || this.onebot?.selfNickname || ''
+    };
+  }
+
+  /** 最近消息（给判定插件看上下文；只读快照，不含触发批里的未读也行）。 */
+  #recentForJudge(chatKey) {
+    try {
+      return this.store.recent(chatKey, { limit: 30 }).map((m) => ({
+        text: String(m.text ?? ''),
+        ts: Number(m.ts) || 0,
+        senderId: String(m.senderId ?? ''),
+        senderName: String(m.senderName ?? ''),
+        atMe: m.atMe === true,
+        isPoke: m.isPoke === true,
+        isSelf: m.self === true
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 触发判定扩展点：把核心的同步判定交给 `reply.interest-judge` 插件复核。
+   *
+   * 契约（详见 doc/extend_development/skill-reference.md）：
+   *   · 入参 { base, chatKey, kind, chatId, chatName, model, provider,
+   *           visionEnabled, searchEnabled, proactive, sessionId,
+   *           triggerEntries, recent, botName, selfNickname }
+   *   · 返回 { respond: boolean, reason?: string }
+   *
+   * 规则：
+   *   ① 私聊、被艾特、拍了拍我 → 不咨询（核心直接召唤，插件不能吃掉）；
+   *   ② 无提供者 / 返回非法 / 抛错 / 超时（>300ms）→ 原样返回 base
+   *      （fail-open：装了个坏插件 = 没装，行为与没有扩展点时完全一致）；
+   *   ③ 允许双向覆盖：base=false → 接话；base=true → 不接。核心只信 respond 布尔，
+   *      reason 仅用于解释（写进会话的 contextReason）；
+   *   ④ base 为"未触发"（count=0）却被插件改成接话时，把 count 补成常规已读条数
+   *      —— 否则接话的会话会读到 0 条历史，接话质量无从谈起。
+   */
+  async #refineWakeDecision(base, info) {
+    const b = {
+      tier: Number.isFinite(Number(base?.tier)) ? Number(base.tier) : 0,
+      reason: String(base?.reason || ''),
+      shouldRespond: base?.shouldRespond === true,
+      count: Math.max(0, Number(base?.count) || 0)
+    };
+    if (!this.#judgeEligible(b, info)) return b;
+    const fn = this.#capFirst('reply.interest-judge', {});
+    if (!fn) return b;
+
+    let timer = null;
+    let result;
+    try {
+      result = await Promise.race([
+        Promise.resolve().then(() => fn({ ...info, base: b })),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(WAKE_JUDGE_TIMEOUT), WAKE_JUDGE_TIMEOUT_MS);
+          timer.unref?.();
+        })
+      ]);
+    } catch (error) {
+      // 抛错 = 插件坏了：回退核心判定，只记一条错误供 UI 排障。
+      skillManager.recordError('reply.interest-judge', error);
+      return b;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (result === WAKE_JUDGE_TIMEOUT) {
+      skillManager.recordError('reply.interest-judge', `判定超时（>${WAKE_JUDGE_TIMEOUT_MS}ms），已回退核心判定`);
+      return b;
+    }
+    // 返回非法（undefined / 非对象 / respond 不是布尔）→ 回退 base。
+    if (!result || typeof result !== 'object' || typeof result.respond !== 'boolean') return b;
+    const out = { ...b, shouldRespond: result.respond };
+    const reason = typeof result.reason === 'string' ? result.reason.trim() : '';
+    if (reason) out.reason = reason.slice(0, 120);
+    // base 是"未触发"（count=0）却接话：补上常规已读条数（见规则 ④）。
+    if (out.shouldRespond && out.count <= 0) {
+      out.count = Math.max(1, Number(storeConfigForChat(info?.chatKey).historyCount) || 80);
+    }
+    return out;
   }
 
   /**
@@ -439,9 +610,10 @@ export class Orchestrator {
         }
         hasTrigger = true;   // onIncoming 判定过"触发"，批内必然有触发消息
       } else if (!active) {
-        // 补判定：对每条未读单独跑 resolveContextTier（与 onIncoming 同口径）
+        // 补判定：对每条未读单独跑 resolveContextTier（与 onIncoming 同口径），
+        // 再走触发判定扩展点复核（无提供者/插件异常时 = 原判定）。
         for (const m of probe) {
-          const r = resolveContextTier({
+          const base = resolveContextTier({
             triggerEntries: [m],
             selfNickname: cfgForJudge.persona?.selfNickname || this.onebot.selfNickname || '',
             botName: cfgForJudge.persona?.botName || '',
@@ -450,6 +622,9 @@ export class Orchestrator {
             isPrivate: String(chatKey).startsWith('private:'),
             roll: null
           });
+          const r = await this.#refineWakeDecision(base, this.#wakeJudgeInfo({
+            chatKey, base, triggerEntries: [m], proactive: false
+          }));
           if (r.shouldRespond) { batchFloorTs = m.ts; hasTrigger = true; break; }   // 最早的触发消息定边界
         }
       } else {
@@ -525,9 +700,29 @@ export class Orchestrator {
     // 活跃期覆盖：必响应，读取条数与其余档位一致（统一 historyCount），
     // reason 标注活跃来源，会话页可解释"为什么 1 档设置却响应了"。
     const activeState = this.#activeState(chatKey);
-    const effectiveTier = activeState
+    const tierBeforeJudge = activeState
       ? { tier: 3, count: Math.max(0, Number(storeConfigForChat(chatKey).historyCount) || 80), reason: `活跃期（话题：${activeState.topic}）`, shouldRespond: true }
       : tierResult;
+    // 触发判定扩展点的最后一站：插件可双向覆盖（base=false→接话；base=true→不接）。
+    // 无提供者 / 非法返回 / 抛错 / >300ms → 原样返回 tierBeforeJudge，
+    // 行为与没有这个扩展点时完全一致。
+    const effectiveTier = await this.#refineWakeDecision(tierBeforeJudge, this.#wakeJudgeInfo({
+      chatKey,
+      base: tierBeforeJudge,
+      triggerEntries,
+      proactive,
+      sessionId: waitingSessionId,
+      chatName: this.chatNameCache.get(String(chatKey).split(':')[1]) || ''
+    }));
+    if (!effectiveTier.shouldRespond) {
+      // 插件判定"这次不该接话"：触发批已 drain（消息保持已读、沉入历史），
+      // 丢弃等待会话壳、不调模型 —— 与"补判定全部未触发"同一后果。
+      console.log(`[orchestrator] ${chatKey} 触发判定插件否决本次唤醒（${effectiveTier.reason || '无原因'}），消息标已读`);
+      this.store.markAllRead(chatKey);
+      if (waitingSessionId) this.#discardWaiting(waitingSessionId);
+      this.emit('chat-update', chatKey);
+      return;
+    }
 
     this.runningChats.add(chatKey);
     const seq = (this.runSeq.get(chatKey) || 0) + 1;
