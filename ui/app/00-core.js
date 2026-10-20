@@ -723,6 +723,39 @@ function hideLoading() {
   }
 }
 
+/**
+ * 启动看门狗（2026-10-20）：**任何原因**导致启动链路没跑完，遮罩都不许把控制台锁死。
+ *
+ * 失败的形态不止「抛错」一种：11-init.js 根本没执行（脚本被拦/主线程被占）、
+ * 某个 await 永远不 settle、浏览器插件拦截请求……这些都不会留下可见报错，
+ * 用户看到的就是一个永远转圈的「正在启动」。所以这里按时间兜底：
+ *   · 到期仍在启动 → 遮罩上打印可操作提示（含「按 F12 看 Console」）；
+ *   · 再等一档仍没 ready → 强制摘罩，让页面至少能看、能点。
+ * 正常启动会在 ready 时清掉定时器，不产生任何额外请求。
+ * 延时可用 window.__BOOT_WATCHDOG_MS 覆盖（测试用，生产不设即默认）。
+ */
+function armBootWatchdog() {
+  const raw = Number(globalThis.__BOOT_WATCHDOG_MS);
+  const hintMs = Number.isFinite(raw) && raw > 0 ? raw : 15000;
+  const forceMs = hintMs * 2;
+  setTimeout(() => {
+    if (appReady) return;
+    try {
+      setLoadingStatus('启动已超过 ' + Math.round(hintMs / 1000) + ' 秒。若一直停在这里：按 F12 打开 Console 看报错；'
+        + '或在浏览器里强制刷新（Ctrl/Cmd+Shift+R）。稍后会自动摘掉这个遮罩，便于直接操作控制台。');
+    } catch { /* ignore */ }
+  }, hintMs);
+  setTimeout(() => {
+    if (appReady) return;
+    try {
+      console.error('[boot] 启动超时：遮罩强制关闭（页面可能只渲染了一部分，请看 Console 报错）');
+      hideLoading();
+    } catch { /* ignore */ }
+  }, forceMs);
+}
+
+armBootWatchdog();
+
 async function pollUntilReady(startedAt) {
   try {
     const status = await api('/api/status');
