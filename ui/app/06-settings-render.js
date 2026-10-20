@@ -38,6 +38,10 @@ function renderSettingsSidebar() {
   const s = state.status;
   const sidebar = $('#settings-sidebar');
   if (!sidebar) return;
+  // 侧栏每次整体重建都会换掉搜索框：重建前记住焦点，重建后还回去，
+  // 否则保存/状态轮询触发的重渲染会让正在输入的搜索词失焦。
+  const prevSearch = $('#settings-search');
+  const hadSearchFocus = !!prevSearch && document.activeElement === prevSearch;
   const menu = [
     ['api', '模型 API'],
     ['search', '搜索服务'],
@@ -51,6 +55,11 @@ function renderSettingsSidebar() {
     ['tools', '工具与技能']
   ];
   sidebar.innerHTML = `
+    <div class="settings-search-box">
+      <input id="settings-search" class="settings-search-input" type="search"
+             placeholder="搜索设置项…" aria-label="搜索设置项" autocomplete="off" spellcheck="false"
+             value="${esc(settingsSearchQuery)}" />
+    </div>
     <div class="settings-runstate">
       <div class="rs-title">机器人运行状态</div>
       <div class="rs-row"><span class="dot ${s?.onebot?.connected ? 'dot-on' : 'dot-off'}"></span><span>${s?.onebot?.connected ? '运行中' : '未就绪'}</span></div>
@@ -60,6 +69,23 @@ function renderSettingsSidebar() {
       ${menu.map(([id, label]) => `<button class="settings-menu-item ${state.settingsSection === id ? 'active' : ''}" data-section="${id}">${label}${id === 'desktop' && (typeof updateAvailable !== 'undefined' && updateAvailable) ? '<span class="update-dot" title="发现新版本"></span>' : ''}</button>`).join('')}
       <button class="settings-menu-item egg-hot" id="qrcode-egg-btn">！？群群？！</button>
     </div>`;
+  // 设置项搜索：输入即过滤当前分区；Esc 清空（不关闭别的弹窗，事件不再上抛）
+  const searchInput = sidebar.querySelector('#settings-search');
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => {
+      settingsSearchQuery = e.currentTarget.value || '';
+      applySettingsSearch();
+    });
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      clearSettingsSearch();
+    });
+    if (hadSearchFocus) {
+      try { searchInput.focus({ preventScroll: true }); } catch { /* jsdom / 旧内核忽略 */ }
+    }
+  }
   // 群二维码彩蛋：点一下弹出，再点屏幕任意位置关闭
   // 图片 onerror 兜底：group-qrcode.jpg 正常随 ui/ 分发，
   // 万一分发包缺了这张图，显示一句说明而不是一个裂图图标。
@@ -78,6 +104,8 @@ function renderSettingsSidebar() {
       // 否则刚输入的内容直接被重渲染吹掉（与切页签同一条防线）。
       flushSettingsSaves();
       state.settingsSection = el.dataset.section;
+      // 地址栏跟着分区走（replaceState：不产生历史垃圾，不改变前进/后退语义）
+      if (typeof syncTabHash === 'function') syncTabHash('settings', state.settingsSection);
       renderSettingsSidebar();
       renderSettings();
       // 切设置分区 = 整页表单重建：新内容淡入（对齐 concept2 的 pane 切换）
@@ -124,8 +152,21 @@ function renderSettings() {
     // 先折叠收纳再绑事件：autoFold 会搬 DOM，但节点上的监听会跟着节点走；
     // 挂在 #settings-form 上的委托不受影响。放后面绑定则能找到最终结构。
     if (typeof enhanceConcept2UI === 'function') enhanceConcept2UI(box);
+    // 搜索空态提示必须在 autoFold 之后追加：autoFold 会把 #settings-form 的
+    // 直接子元素卷进折叠卡，先加会被卷进某张卡里、过滤时找不到它。
+    appendSettingsSearchEmpty(box);
     bindSettingsEvents(c);
+    bindAdoptCurrentProvider(box);
+    // 侧栏搜索词跨分区/重渲染保持：新表单渲染完立刻按当前查询过滤一次
+    applySettingsSearch();
     if (box && prevScrollTop) box.scrollTop = prevScrollTop;
+    // 深链待办：地址栏 hash 指定的卡片在新 DOM 上定位（见 requestSettingsCardFocus）。
+    // 放在滚动位置恢复之后：否则会被"回到阅读位置"覆盖掉。
+    if (pendingSettingsCardId) {
+      const cardId = pendingSettingsCardId;
+      pendingSettingsCardId = '';
+      focusSettingsCard(cardId);
+    }
   } catch (err) {
     // 单个设置区渲染失败不能让整页空白 —— 显示错误占位，其余页签仍可用
     console.error('[settings] 渲染失败:', err);
@@ -170,8 +211,145 @@ function renderSettingsSection(c) {
   return `
     ${render()}`;
 }
+
+/* ── 设置项搜索 / 深链定位 ──────────────────────────────────────────────
+   搜索：只过滤**当前分区**的 .setcard（切分区后同一个词继续生效）。
+        命中的取数面 = 卡片可见文本（标题 / 副标题 / label / hint）
+        + 卡内输入控件的 title / placeholder / aria-label
+        —— 后三者不在 textContent 里，只能按属性补。
+   深链：focusSettingsCard() 滚动到卡片并高亮 1.5s；设置页渲染是异步的
+        （loadSettings 拿到配置后才 render），所以卡片没出现时短轮询等它。 */
+let settingsSearchQuery = '';
+
+function settingsCardHaystack(card) {
+  let text = card.textContent || '';
+  for (const el of card.querySelectorAll('input, textarea, select')) {
+    text += ' ' + (el.getAttribute('title') || '')
+      + ' ' + (el.getAttribute('placeholder') || '')
+      + ' ' + (el.getAttribute('aria-label') || '');
+  }
+  return text.toLowerCase();
+}
+
+function appendSettingsSearchEmpty(form) {
+  if (!form || form.querySelector('#settings-search-empty')) return;
+  const empty = document.createElement('div');
+  empty.id = 'settings-search-empty';
+  empty.className = 'settings-search-empty';
+  empty.textContent = '没有匹配的设置项';
+  empty.hidden = true;
+  form.appendChild(empty);
+}
+
+function applySettingsSearch() {
+  const form = $('#settings-form');
+  if (!form) return;
+  const tokens = String(settingsSearchQuery || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  let hits = 0;
+  for (const card of form.querySelectorAll('.setcard')) {
+    const hay = settingsCardHaystack(card);
+    const hit = tokens.length === 0 || tokens.every((t) => hay.includes(t));
+    card.classList.toggle('search-hidden', !hit);
+    if (hit) hits += 1;
+  }
+  const empty = form.querySelector('#settings-search-empty');
+  if (empty) empty.hidden = !(tokens.length > 0 && hits === 0);
+}
+
+function clearSettingsSearch() {
+  settingsSearchQuery = '';
+  const input = $('#settings-search');
+  if (input) input.value = '';
+  applySettingsSearch();
+}
+
+function focusSettingsSearch() {
+  const input = $('#settings-search');
+  if (!input) return false;
+  try { input.focus({ preventScroll: true }); } catch {
+    try { input.focus(); } catch { /* ignore */ }
+  }
+  try { input.select(); } catch { /* jsdom 部分实现没有 select */ }
+  return true;
+}
+
+/**
+ * 深链待办：hash 解析出 cardId 后先记在这里，由**紧随其后的那次 renderSettings**
+ * 在新 DOM 上消费。不能立刻定位 —— switchTab('settings') 会先 loadSettings()
+ * 再整页重建表单，直接给旧节点加高亮会随 innerHTML 一起被扔掉。
+ */
+let pendingSettingsCardId = '';
+
+function requestSettingsCardFocus(cardId) {
+  pendingSettingsCardId = String(cardId || '');
+}
+
+/** 深链定位：滚动到设置卡并短暂高亮（1.5s 后移除）。返回是否定位成功。 */
+function focusSettingsCard(cardId) {
+  const id = String(cardId || '');
+  if (!id) return false;
+  const form = $('#settings-form');
+  const card = form ? form.querySelector('#' + id) : null;
+  if (!card) return false;
+  try {
+    if (typeof card.scrollIntoView === 'function') card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  } catch { /* 旧内核 / 测试桩没有该实现 */ }
+  card.classList.add('is-deeplink');
+  clearTimeout(focusSettingsCard._timer);
+  focusSettingsCard._timer = setTimeout(() => card.classList.remove('is-deeplink'), 1500);
+  return true;
+}
+
+// Ctrl/Cmd+K：聚焦设置搜索框。全仓此前没有任何 ctrl/meta 组合键（已 grep），
+// 所以不需要退到 "/" 兜底；只在设置页生效，避免从别处劫持这个常用组合键。
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+  if (String(e.key || '').toLowerCase() !== 'k') return;
+  if (typeof state === 'undefined' || state.tab !== 'settings') return;
+  if (!focusSettingsSearch()) return;
+  e.preventDefault();
+});
+/**
+ * 「补登记到模型目录」按钮：config.api 里已经选好渠道（provider/model/baseUrl，
+ * Key 可能也已保存），但 providers 目录里没有这个 id 时（孤儿配置），调后端
+ * /api/providers/adopt-current 把它登记成正式渠道。
+ * 成功后必须用 loadSettings() 刷新 —— 它同时重拉 /api/config 与 /api/providers
+ * 并重渲染设置页，state.providers 才会带上新渠道；自己另拼一份刷新逻辑会和
+ * 设置页的 state 更新漂移。
+ */
+function bindAdoptCurrentProvider(box) {
+  const btn = box?.querySelector?.('#adopt-current-provider-btn');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = '登记中…';
+    try {
+      const r = await api('/api/providers/adopt-current', { method: 'POST' });
+      await loadSettings();
+      const hint = $('#provider-hint');
+      if (hint) hint.textContent += r?.created === false ? ' · 已登记（渠道原本已在目录中）' : ' · 已登记';
+    } catch (e) {
+      const hint = $('#provider-hint');
+      if (hint) hint.textContent = `补登记失败：${e.message}`;
+      btn.disabled = false;
+      btn.textContent = '补登记到模型目录';
+    }
+  });
+}
+
 function renderApiSection(c) {
   const currentProvider = (state.providers || []).find((p) => p.id === c.api.provider);
+  // 孤儿配置：api 里选好了渠道，但 providers 目录里没有这个 id（currentProvider
+  // 找不到）。旧文案直接显示「尚未选择模型」，用户会以为模型没配过（VPS 现场
+  // 就是这样）。这里把真实配置摆出来，并给「补登记到模型目录」入口 —— 登记后
+  // 后端会把 api.provider 改写成新渠道 id，前端立刻能匹配到。
+  const currentProviderHint = currentProvider
+    ? `当前：${esc(currentProvider.displayName)} · ${esc(c.api.model || '未选模型')} @ ${esc(currentProvider.baseURL)}${currentProvider.hasKey ? ' · 已保存 API Key（不显示）' : ' · 未保存 API Key'}`
+    : String(c.api.model || '').trim()
+      ? `当前：${esc(c.api.model)} @ ${esc(c.api.baseUrl || '（未填 BaseURL）')} · API Key ${(c.api.hasApiKey ?? c.api.hasKey) ? '已保存（不显示）' : '未保存'} —— 该渠道未登记到模型目录`
+        + '<button class="btn btn-small" id="adopt-current-provider-btn" style="margin-left:8px">补登记到模型目录</button>'
+      : '尚未选择模型';
   const currentModelDisplay = (currentProvider?.modelNames || {})[c.api.model] || c.api.model;
   // 专用模型的显示名：跨提供商选择时也能读出目录名（找不到就显示裸 id）
   const displayOf = (modelId) => {
@@ -201,7 +379,7 @@ function renderApiSection(c) {
         <button class="btn" id="open-model-config-btn">⚙ 模型配置</button>
         <button class="btn" id="open-model-manage-btn">🗂 模型管理</button>
       </div>
-      <div class="hint" id="provider-hint" style="margin-top:6px">${currentProvider ? `当前：${esc(currentProvider.displayName)} · ${esc(c.api.model || '未选模型')} @ ${esc(currentProvider.baseURL)}${currentProvider.hasKey ? ' · 已保存 API Key（不显示）' : ' · 未保存 API Key'}` : '尚未选择模型'}</div>
+      <div class="hint" id="provider-hint" style="margin-top:6px">${currentProviderHint}</div>
       <div class="hint" id="model-vision-hint" style="margin-top:6px"></div>
       <input type="hidden" id="cfg-provider" value="${esc(c.api.provider || '')}" />
       <input type="hidden" id="cfg-model" value="${esc(c.api.model || '')}" />
@@ -1116,18 +1294,12 @@ function renderDesktopSection(c) {
       </div></div>`;
 }
 
-function renderOnebotSection(c) {
+/**
+ * OneBot 连接三件套（WS 地址 / HTTP 地址 / 两个令牌）。
+ * 两种协议端形态都要填，抽出来避免 external / embedded 两个分支各写一份。
+ */
+function onebotConnectionFields(c) {
   return `
-    <h3 id="settings-onebot">OneBot（SnowLuma）</h3>
-    <div class="hint" style="margin-bottom:10px">SnowLuma 的启动、关闭与日志已移动到顶部「SnowLuma」页签。此处只保留连接配置。</div>
-    <div class="field"><label>SnowLuma 程序目录（留空 = 自动使用项目内 snowluma/ 文件夹）</label>
-      <div style="display:flex;gap:8px">
-        <input type="text" id="cfg-snowlumadir" value="${esc(c.snowluma.dir || '')}" style="flex:1" />
-        <button class="btn btn-small" id="open-snowluma-btn">打开文件夹</button>
-      </div>
-      <div class="hint" id="snowluma-hint"></div></div>
-    <div class="checkbox-row"><input type="checkbox" id="cfg-snowlumalaunch" ${c.snowluma.autoLaunch ? 'checked' : ''} />
-      <label for="cfg-snowlumalaunch">QQ Agent 启动时自动拉起 SnowLuma（未运行时）</label></div>
     <div class="field-row">
       <div class="field"><label>WebSocket 地址（收消息）</label><input type="text" id="cfg-wsurl" value="${esc(c.snowluma.wsUrl)}" /></div>
       <div class="field"><label>HTTP 地址（发消息）</label><input type="text" id="cfg-httpurl" value="${esc(c.snowluma.httpUrl)}" /></div>
@@ -1141,7 +1313,43 @@ function renderOnebotSection(c) {
           <input type="password" id="cfg-obhttptoken" value="${esc(c.snowluma?.hasHttpAccessToken ? '******' : '')}" placeholder="输入新令牌可替换；留空保持不变" autocomplete="new-password" style="flex:1" />
           <button class="btn btn-small" id="cfg-obhttptoken-toggle" type="button">显示</button>
         </div></div>
+    </div>`;
+}
+
+function renderOnebotSection(c) {
+  // 外部协议端（NapCat 容器）模式：程序目录 / 自动拉起 / 打开文件夹这些
+  // 「本应用管理内置 SnowLuma 进程」的控件在这套部署里全是无效操作 ——
+  // 线上点「打开文件夹」直接 400，也不该出现"未找到目录/未运行"这类假警报。
+  // 整块换成一句说明 + 协议端状态入口；连接地址与令牌保留（连外部容器同样要填）。
+  if (isExternalProtocolMode(state.status)) {
+    return `
+    <h3 id="settings-onebot">OneBot（SnowLuma）</h3>
+    <div class="setcard" id="card-onebot-external">
+      <div class="setcard-head">
+        <div class="sc-ico gray">🔌</div>
+        <div class="sc-tt"><h4>协议端由外部容器提供</h4>
+          <div class="sc-sub">本应用不管理 NapCat 的进程与程序目录</div></div>
+      </div>
+      <div class="setcard-body">
+        <div class="hint">协议端由外部容器（NapCat）提供，本页不管理它的进程；排障：<code>systemctl --user status napcat</code></div>
+        <div style="margin-top:10px"><button class="btn btn-small" id="goto-protocol-status-btn" type="button">查看协议端状态</button></div>
+      </div>
     </div>
+    ${onebotConnectionFields(c)}
+    <div class="hint">改完 OneBot 地址需要重启应用生效；模型/人设/白名单即时生效。</div>`;
+  }
+  return `
+    <h3 id="settings-onebot">OneBot（SnowLuma）</h3>
+    <div class="hint" style="margin-bottom:10px">SnowLuma 的启动、关闭与日志已移动到顶部「SnowLuma」页签。此处只保留连接配置。</div>
+    <div class="field"><label>SnowLuma 程序目录（留空 = 自动使用项目内 snowluma/ 文件夹）</label>
+      <div style="display:flex;gap:8px">
+        <input type="text" id="cfg-snowlumadir" value="${esc(c.snowluma.dir || '')}" style="flex:1" />
+        <button class="btn btn-small" id="open-snowluma-btn">打开文件夹</button>
+      </div>
+      <div class="hint" id="snowluma-hint"></div></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-snowlumalaunch" ${c.snowluma.autoLaunch ? 'checked' : ''} />
+      <label for="cfg-snowlumalaunch">QQ Agent 启动时自动拉起 SnowLuma（未运行时）</label></div>
+    ${onebotConnectionFields(c)}
     <div class="hint">改完 OneBot 地址需要重启应用生效；模型/人设/白名单即时生效。</div>`;
 }
 

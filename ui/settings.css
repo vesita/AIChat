@@ -1,0 +1,63 @@
+/* ══ 设置页：字段搜索 + hash 深链定位（S1 第二批） ══════════════════════════
+   单独成文件：ui/style.css 是公共样式，本组件的规则只放这里，避免和别的改动撞。
+
+   视觉契约（全部复用 style.css 的 token，不新造色板）：
+   · 搜索框 = 侧栏顶部一条安静的输入行（sticky：菜单再长也够得着）；
+     只有聚焦时才用 accent 描边，不抢运行状态卡的注意力；
+   · 过滤不逐卡加淡入淡出 —— 侧栏/表单都在带合成层的滚动容器里，
+     一堆并行 animation 会掉帧；直接把不命中的卡从布局里摘掉；
+   · 深链高亮是一次 1.5s 的呼吸（JS 到期移除 class），它不是常驻状态标记，
+     只是"定位到了"的确认。 */
+
+/* ── 搜索框 ─────────────────────────────────────────────────────────────── */
+.settings-search-box {
+  position: sticky; top: 0; z-index: 2;
+  margin: -13px -10px 10px; padding: 13px 10px 8px;
+  background: var(--bg1);
+}
+
+.settings-search-input {
+  width: 100%; height: 32px; padding: 0 11px;
+  background: var(--bg0); border: 1px solid var(--bd2); border-radius: var(--r-sm);
+  color: var(--tx); font: inherit; font-size: 12.5px; line-height: 1;
+  outline: none;
+  transition: border-color var(--t-fast) var(--ease-in-out),
+              box-shadow var(--t-fast) var(--ease-in-out);
+}
+.settings-search-input::placeholder { color: var(--tx3); }
+.settings-search-input:hover { border-color: var(--tx3); }
+.settings-search-input:focus {
+  border-color: var(--ac-line);
+  box-shadow: 0 0 0 3px var(--ac-soft);
+}
+/* 原生 search 的清除叉在暗色下几乎看不见，且 Esc 已是约定的清空手势：
+   统一摘掉，避免出现一个"看起来没反应"的控件。 */
+.settings-search-input::-webkit-search-cancel-button,
+.settings-search-input::-webkit-search-decoration { -webkit-appearance: none; appearance: none; }
+
+/* ── 过滤结果 ───────────────────────────────────────────────────────────── */
+.setcard.search-hidden { display: none !important; }
+
+.settings-search-empty {
+  margin: 10px 2px 0; padding: 12px 14px;
+  border: 1px dashed var(--bd2); border-radius: var(--r-sm);
+  background: var(--bg1); color: var(--tx3); font-size: 12.5px; line-height: 1.6;
+}
+.settings-search-empty[hidden] { display: none !important; }
+
+/* ── 深链定位高亮（JS 在 1.5s 后移除 .is-deeplink） ─────────────────────── */
+.setcard.is-deeplink { animation: settingsDeeplink 1.5s var(--ease-out-quart) both; }
+
+@keyframes settingsDeeplink {
+  0%   { border-color: var(--ac);     box-shadow: 0 0 0 3px var(--ac-soft); }
+  60%  { border-color: var(--ac-line); box-shadow: 0 0 0 3px var(--ac-soft); }
+  100% { border-color: var(--bd);     box-shadow: 0 0 0 0 transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .setcard.is-deeplink {
+    animation: none;
+    border-color: var(--ac);
+    box-shadow: 0 0 0 3px var(--ac-soft);
+  }
+}

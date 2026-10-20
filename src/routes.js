@@ -653,6 +653,48 @@ export function createRoutes(deps) {
       }
     },
     {
+      // 补登记「孤儿配置」：config.api 里已经选好 provider/model/baseUrl（Key 可能也
+      // 已经存着），但 providers 目录里没有这个 id —— 前端模型卡片据此判定
+      // currentProvider 找不到、显示「尚未选择模型」，用户会以为模型没配。
+      // 这里把它登记成正式渠道：
+      //   1) 已有同 id 条目 → 直接返回（幂等，不重复建）
+      //   2) 否则 upsertProvider 建渠道（会生成 custom_xxx id），再把 api.provider
+      //      改写成新 id —— 不改写的话前端仍然找不到，等于没登记
+      //   3) api.apiKey 由 upsertProvider 写进 dshProviderKeys[新 id]
+      method: 'POST', pattern: '/api/providers/adopt-current',
+      handler: async ({ res, json }) => {
+        try {
+          const cfg = getConfig();
+          const api = cfg.api || {};
+          const providerId = String(api.provider || '').trim();
+          const baseUrl = String(api.baseUrl || '').trim();
+          if (!providerId) {
+            return json(res, 400, { ok: false, error: '当前配置没有选中的提供商（api.provider 为空），无法补登记到模型目录。' });
+          }
+          if (!baseUrl) {
+            return json(res, 400, { ok: false, error: '当前配置没有 Base URL（api.baseUrl 为空），无法补登记到模型目录。' });
+          }
+          const existing = currentProviders().find((p) => p.id === providerId);
+          if (existing) {
+            return json(res, 200, { ok: true, created: false, provider: sanitizeProvider(existing), providerId });
+          }
+          const model = String(api.model || '').trim();
+          const apiKey = String(api.apiKey || '').trim();
+          const r = upsertProvider({ baseUrl, apiKey, models: model ? [model] : [] });
+          const newId = r.provider.id;
+          // 改写选中渠道：upsertProvider 生成的是 custom_xxx id，旧 id（如 si-beat）
+          // 在目录里不存在，不改写前端仍会判定「尚未选择模型」。
+          // 只 patch api.provider：deepMerge 递归合并，不会碰 api 下的其它字段。
+          updateConfig({ api: { provider: newId } });
+          return json(res, 200, {
+            ok: true, created: r.created, provider: sanitizeProvider(r.provider), providerId: newId
+          });
+        } catch (error) {
+          return json(res, 400, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+    },
+    {
       method: 'POST', pattern: '/api/providers/models',
       handler: async ({ req, res, json }) => {
         try {

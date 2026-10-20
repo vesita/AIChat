@@ -890,7 +890,67 @@ async function resumePause({ skipBacklog = false } = {}) {
   }
 }
 
-function switchTab(name) {
+// ── hash 深链：URL ↔ 页签 / 设置分区 / 设置卡片 ─────────────────────────
+// 支持的形态（其余一律当没带深链，行为与改造前一致）：
+//   #<tab>                        普通页签（sessions / chats / … / snowluma）
+//   #settings/<section>           设置页 + 左侧分组
+//   #settings/<section>/<cardId>  再定位到某张设置卡（滚动 + 短暂高亮，见 focusSettingsCard）
+// 写回一律走 replaceState：地址栏可复制、刷新能还原，但不产生历史垃圾；
+// 浏览器前进/后退语义不变（replaceState 既不加历史条目，也不触发 hashchange）。
+const TAB_HASH_IDS = ['sessions', 'chats', 'memory', 'usage', 'skills', 'plugins', 'snowluma', 'settings'];
+const SETTINGS_HASH_SECTIONS = ['api', 'search', 'memory', 'persona', 'allow', 'participation', 'chat', 'desktop', 'onebot', 'tools'];
+
+/** 解析 location.hash；不认识的一律返回 null。 */
+function parseTabHash(hash) {
+  const raw = String(hash || '').replace(/^#\/?/, '');
+  if (!raw) return null;
+  let parts;
+  try { parts = raw.split('/').map((p) => decodeURIComponent(p)); } catch { return null; }
+  const tab = parts[0];
+  if (!TAB_HASH_IDS.includes(tab)) return null;
+  if (tab !== 'settings') return { tab, section: '', card: '' };
+  const section = SETTINGS_HASH_SECTIONS.includes(parts[1]) ? parts[1] : '';
+  // cardId 只接受安全字符：它会被拼进 '#<id>' 选择器，不接受任意字符串
+  const card = /^[A-Za-z0-9_-]+$/.test(parts[2] || '') ? parts[2] : '';
+  return { tab, section, card };
+}
+
+/** 把当前页签（设置页带分区/卡片）写回地址栏。 */
+function syncTabHash(tab, section = '', card = '') {
+  const hash = tab === 'settings'
+    ? `#settings${section ? `/${section}` : ''}${card ? `/${card}` : ''}`
+    : `#${tab}`;
+  if (typeof location === 'undefined' || location.hash === hash) return;
+  if (typeof history === 'undefined' || typeof history.replaceState !== 'function') return;
+  try { history.replaceState(null, '', hash); } catch { /* file:// 等环境退化为无深链 */ }
+}
+
+/**
+ * 应用地址栏深链：切页签 → 切设置分区 → 定位卡片。
+ * 返回是否真的应用了（地址栏没带可识别 hash 时返回 false）。
+ */
+function applyLocationHash() {
+  const parsed = parseTabHash(typeof location !== 'undefined' ? location.hash : '');
+  if (!parsed) return false;
+  if (parsed.tab === 'settings' && parsed.section) state.settingsSection = parsed.section;
+  // fromHash：地址栏已经是目标形态，不要再写一遍（否则会把 /<cardId> 冲掉）
+  switchTab(parsed.tab, { fromHash: true });
+  // 卡片定位交给下一次 renderSettings 消费：switchTab 会先 loadSettings()
+  // 再整页重建，立刻给旧节点加高亮会随 innerHTML 一起被扔掉。
+  if (parsed.tab === 'settings' && parsed.card && typeof requestSettingsCardFocus === 'function') {
+    requestSettingsCardFocus(parsed.card);
+  }
+  return true;
+}
+// 普通脚本本来也是全局绑定，这里写明「测试直接取 window.applyLocationHash」的意图
+window.applyLocationHash = applyLocationHash;
+
+function switchTab(name, opts = {}) {
+  // 地址栏与当前页签保持一致（点击页签 = replaceState，见 syncTabHash）。
+  // fromHash 时不回写：那次调用就是因为地址栏已经带了目标 hash。
+  if (!opts.fromHash) {
+    syncTabHash(name, name === 'settings' ? (state.settingsSection || 'api') : '');
+  }
   // 离开设置页（无论去哪）前，先把防抖窗口内还没落盘的改动立即保存。
   // 必须在页签切换、任何 loadXxx 触发**之前**做：等切走之后表单 DOM 还在
   // （只是视图隐藏）其实也能读，但"正在输入的最后一个字段"可能只过了
